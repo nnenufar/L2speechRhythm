@@ -1,8 +1,10 @@
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
 import pandas as pd
 import numpy as np
+
+data_sources = ['MSP']
 
 def process_labels(labels: list):
     unique_labels = sorted(set(labels))
@@ -26,13 +28,16 @@ class NpzDataset(Dataset):
     Custom Dataset for data stored in a single .npz archive.
     Input: .npz timestamps filepath, MSP labels_consensus.csv filepath.
     """
-    def __init__(self, npz_path, labels_path):
+    def __init__(self, npz_path, data_source):
+        assert data_source in set(data_sources), "Invalid data source. Check data directory for available options."
+
         # Load the entire .npz file into memory. It behaves like a dictionary.
         self.sequences_data = np.load(npz_path)
 
-        # Load the corresponding labels from a separate file.
-        self.labels = pd.read_csv(labels_path)
-        self.labels = self.labels.set_index('FileName')['EmoClass'].to_dict()
+        if data_source == 'MSP':
+            # Load the corresponding labels from a separate file.
+            self.labels = pd.read_csv(f'data/{data_source}/labels_consensus.csv')
+            self.labels = self.labels.set_index('FileName')['EmoClass'].to_dict()
 
         # Not all audios have an associated label entry.
         # Intersect keys to ensure we only use data that is present in both files.
@@ -59,6 +64,9 @@ class NpzDataset(Dataset):
         label = self.labels_str2int.get(label)
 
         return torch.tensor(sequence, dtype=torch.float32), torch.tensor(label, dtype=torch.long)
+    
+dataset = NpzDataset('data/MSP/beat_timestamps.npz', data_source='MSP')
+dataloader = DataLoader(dataset, batch_size = 32, collate_fn = collate_fn)
     
 ### Example usage
 #dataset = NpzDataset(npz_path, labels_path)

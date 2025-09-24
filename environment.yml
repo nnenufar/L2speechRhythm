@@ -1,0 +1,19 @@
+name: rtm
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - librosa
+  - matplotlib
+  - numpy
+  - praatio
+  - scikit-learn
+  - scipy
+  - pandas
+  - pip:
+    - soundfile
+    - torch
+    - torchvision
+    - torchaudio

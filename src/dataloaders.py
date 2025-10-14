@@ -3,6 +3,8 @@ from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
 import pandas as pd
 import numpy as np
+import pickle
+import lmdb
 
 data_sources = ['MSP']
 
@@ -17,58 +19,58 @@ def collate_fn(batch):
     """
     Padding function to handle variable sequence size
     """
-    sequences, labels = zip(*batch)
-    sequences_padded = pad_sequence(sequences, batch_first = True, padding_value=0.0)
+    feats, intervals, labels = zip(*batch)
+    feats_padded = pad_sequence(feats, batch_first = True, padding_value=0.0)
+    intervals_padded = pad_sequence(intervals, batch_first = True, padding_value=0.0)
+
     labels = torch.stack(labels, dim=0)
 
-    return sequences_padded, labels
+    return feats_padded, intervals_padded, labels
 
-class NpzDataset(Dataset):
+class DatasetLMDB(Dataset):
     """
-    Custom Dataset for data stored in a single .npz archive.
-    Input: .npz timestamps filepath, MSP labels_consensus.csv filepath.
+    Custom Dataset for data stored in lmdb format
+    Input: .lmdb path, audio data source filepath
     """
-    def __init__(self, npz_path, data_source):
+    def __init__(self, lmdb_path, data_source):
         assert data_source in set(data_sources), "Invalid data source. Check data directory for available options."
 
-        # Load the entire .npz file into memory. It behaves like a dictionary.
-        self.sequences_data = np.load(npz_path)
+        self.lmdb_path = lmdb_path
+        self.env = lmdb.open(lmdb_path, readonly=True, lock=False, readahead=False, meminit=False)
 
         if data_source == 'MSP':
+            labels_to_use = ['A', 'H', 'N', 'S']
             # Load the corresponding labels from a separate file.
             self.labels = pd.read_csv(f'data/{data_source}/labels_consensus.csv')
+            self.labels = self.labels[self.labels['EmoClass'].isin(labels_to_use)]
             self.labels = self.labels.set_index('FileName')['EmoClass'].to_dict()
+
+            with self.env.begin() as txn:
+                self.lmdb_keys = [key for key in txn.cursor().iternext(values=False) if key.decode('utf-8') in self.labels.keys()]
 
         # Not all audios have an associated label entry.
         # Intersect keys to ensure we only use data that is present in both files.
-        npz_keys = set(self.sequences_data.keys())
-        label_keys = set(self.labels.keys())
-
-        self.sequence_keys = sorted(list(npz_keys.intersection(label_keys)))
 
         self.labels_map = process_labels(list(self.labels.values()))
         self.labels_str2int = self.labels_map[0]
         self.labels_int2str = self.labels_map[1]
         print(f'Label mapping: {self.labels_str2int}\n')
 
-        assert len(self.sequence_keys) == len(self.labels), \
-            f"The number of sequences and labels must be the same. There are {len(self.sequence_keys)} sequences and {len(self.labels)} labels."
-
     def __len__(self):
-        return len(self.sequence_keys)
+        return len(self.lmdb_keys)
 
     def __getitem__(self, idx):
-        key = self.sequence_keys[idx]
-        sequence = self.sequences_data[key]
+        with self.env.begin() as txn:
+            entry = pickle.loads(txn.get(self.lmdb_keys[idx]))
+        
+        key = entry['key']
         label = self.labels[key]
         label = self.labels_str2int.get(label)
 
-        return torch.tensor(sequence, dtype=torch.float32), torch.tensor(label, dtype=torch.long)
-    
-dataset = NpzDataset('data/MSP/beat_timestamps.npz', data_source='MSP')
-dataloader = DataLoader(dataset, batch_size = 32, collate_fn = collate_fn)
-    
-### Example usage
-#dataset = NpzDataset(npz_path, labels_path)
-#dataloader = DataLoader(dataset, batch_size = BATCH_SIZE, collate_fn = collate_fn)
+        intervals = np.array(entry['intervals'], dtype = np.float32)
+        feats = np.array(entry['feats'], dtype = np.float32)
+
+        return torch.tensor(feats), torch.tensor(intervals), torch.tensor(label)
+
+
 

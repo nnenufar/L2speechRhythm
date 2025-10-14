@@ -1,43 +1,91 @@
+import torch
+import torch.nn.functional as F
 import torch.nn as nn
 
 class CNN_RNN_Classifier(nn.Module):
     """
     A hybrid model combining CNN for feature extraction and RNN for sequence modeling.
+    Includes interval concatenation for temporal context awareness.
     """
-    def __init__(self, input_size, cnn_out_channels, kernel_size, hidden_size, num_classes):
+    def __init__(self,
+                 feat_dim,
+                 kernel_size,
+                 hidden_size,
+                 num_classes, 
+                 cnn_out_channels=None,
+                 num_lstm_layers=2,
+                 dropout=0.1):
         super(CNN_RNN_Classifier, self).__init__()
 
-        # CNN layer to extract local features/motifs
-        # input_size is the feature dimension at each time step (1 for raw data)
-        self.conv1d = nn.Conv1d(in_channels=input_size,
-                                out_channels=cnn_out_channels,
-                                kernel_size=kernel_size)
-        self.relu = nn.ReLU()
-        #self.pool = nn.MaxPool1d(kernel_size=2)
+        self.cnn_out_channels = cnn_out_channels if cnn_out_channels else feat_dim * 2
+        self.dropout = nn.Dropout(dropout)
+
+        self.conv1d_a = nn.Conv1d(
+            in_channels=feat_dim, 
+            out_channels=self.cnn_out_channels,
+            kernel_size=kernel_size,
+            padding='valid' # No padding, already performed by the collate function 
+        )
+        self.batch_norm_a = nn.BatchNorm1d(num_features=self.cnn_out_channels)
+
+        self.conv1d_b = nn.Conv1d(
+            in_channels=self.cnn_out_channels, 
+            out_channels=self.cnn_out_channels,
+            kernel_size=kernel_size,
+            padding='valid' 
+        )
+        self.batch_norm_b = nn.BatchNorm1d(num_features=self.cnn_out_channels)
 
         # LSTM layer to process the sequence of features from the CNN
-        # Input size for the LSTM is the number of output channels from the CNN
-        self.lstm = nn.LSTM(input_size=cnn_out_channels,
-                            hidden_size=hidden_size,
-                            num_layers=1,
-                            batch_first=True)
+        # Input size is CNN output channels + 1 (for the interval feature)
+        self.lstm = nn.LSTM(
+            input_size=self.cnn_out_channels + 1,
+            hidden_size=hidden_size,
+            num_layers=num_lstm_layers,
+            batch_first=True,
+            dropout=dropout if num_lstm_layers > 1 else 0
+        )
 
-        # Final fully connected layer for classification
         self.fc = nn.Linear(hidden_size, num_classes)
 
-    def forward(self, x):
-        x = x.unsqueeze(1) # -> (batch_size, 1, seq_len)
+    def forward(self, x, intervals):
+        """
+        Args:
+            x: Input MFCC features of shape (batch_size, seq_len, feat_dim)
+            interval: Float tensor of shape (batch_size, seq_len)
+        
+        Returns:
+            out: Classification logits of shape (batch_size, num_classes)
+        """
+        # CNN processing
+        x = x.permute(0, 2, 1)    # Conv1d receives (batch_size, feat_dim, seq_len)
+        #print(f'Original Feats shape: {x.shape}')
+        cnn_out = F.relu(self.conv1d_a(x))  # (batch_size, cnn_out_channels, seq_len)
+        cnn_out = self.dropout(self.batch_norm_a(cnn_out))
 
-        cnn_out = self.conv1d(x) # -> (batch_size, cnn_out_channels, new_seq_len)
-        cnn_out = self.relu(cnn_out)
-        #cnn_out = self.pool(cnn_out) # -> (batch_size, cnn_out_channels, even_newer_seq_len)
+        cnn_out = F.relu(self.conv1d_b(cnn_out))
+        cnn_out = self.dropout(self.batch_norm_b(cnn_out))  
+        
+        # Reshape CNN feats for LSTM: (batch_size, seq_len, cnn_out_channels)
+        rnn_input = cnn_out.permute(0, 2, 1)
+        #print(f'RNN input: {rnn_input[0]}')
+        #print(f'shape: {rnn_input.shape}')
 
-        rnn_input = cnn_out.permute(0, 2, 1) # -> (batch_size, even_newer_seq_len, cnn_out_channels)
+        # Reshape intervals for concat
+        intervals = intervals.unsqueeze(2)
+        #print(f'Intervals shape: {intervals.shape}')
+        
+        # Concatenate interval with CNN features along the feature dimension
+        rnn_input = torch.cat([rnn_input, intervals], dim=2)
 
-        _, (h_n, _) = self.lstm(rnn_input) # h_n shape: (num_layers, batch_size, hidden_size)
+        # LSTM processing
+        lstm_out, (h_n, _) = self.lstm(rnn_input)
+        # h_n shape: (num_layers, batch_size, hidden_size)
 
-        last_hidden_state = h_n[-1] # -> (batch_size, hidden_size)
+        last_hidden_state = h_n[-1]  # (batch_size, hidden_size)
+        last_hidden_state = self.dropout(last_hidden_state)
 
-        out = self.fc(last_hidden_state) # -> (batch_size, num_classes)
+        # Classification
+        out = self.fc(last_hidden_state)  # (batch_size, num_classes)
 
         return out

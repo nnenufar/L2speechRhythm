@@ -1,0 +1,27 @@
+{
+  "exp_name": "run_03",
+  "lmdb_path": "data/MSP/rtm_feats.lmdb",
+  "audio_source": "MSP",
+  "batch_size": 64,
+  "model_type": "cnn_rnn",
+  "model_params": {
+    "feat_dim": 13,
+    "kernel_size": 1,
+    "hidden_size": 256,
+    "num_lstm_layers": 2,
+    "dropout": 0.5
+  },
+  "dataset_params": {
+  "lmdb_path": "data/MSP/rtm_feats.lmdb",
+  "data_source": "MSP",
+  "items": ["feats", "intervals"]
+  },
+  "training_params": {
+    "learning_rate": 1e-4,
+    "weight_decay": 1e-4,
+    "num_epochs": 1000,
+    "plot_every": 5,
+    "save_every": 10,
+    "early_stop_patience": 100
+  }
+}

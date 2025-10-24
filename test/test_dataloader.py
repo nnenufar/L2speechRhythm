@@ -1,17 +1,12 @@
 from src.dataloaders import DatasetLMDB, collate_fn
 from torch.utils.data import DataLoader
 
-dataset = DatasetLMDB('data/MSP/rtm_feats.lmdb', data_source='MSP')
-print(f'Feats type: {dataset[0][0].dtype}\nIntervals type: {dataset[0][1].dtype}\nLabels type: {dataset[0][2].dtype}\n')
-print(f'Label mapping: {dataset.labels_int2str}')
+items = ['feats', 'intervals', 'envelope_spectrum']
 
-dataloader = DataLoader(dataset, batch_size = 32, collate_fn = collate_fn, shuffle=True)
+dataset = DatasetLMDB('data/MSP/rtm_feats.lmdb', data_source='MSP', split='Test', items=items)
+dataloader = DataLoader(dataset, batch_size = 32, shuffle=True, collate_fn=collate_fn)
 batch = next(iter(dataloader))
 
-print("Batch type:", type(batch))
-if isinstance(batch, (list, tuple)):
-    for i, item in enumerate(batch):
-        print(f"Item {i} shape/type:", getattr(item, 'shape', type(item)))
-        print(item[-1])
-else:
-    print("Batch:", batch)
+for item in items:
+    print(f"{item} shape: {batch[item].shape} type: {batch[item].dtype}")
+print(f"Label shape: {batch['label'].shape} type: {batch['label'].dtype}")

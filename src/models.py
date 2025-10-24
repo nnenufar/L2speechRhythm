@@ -48,7 +48,7 @@ class CNN_RNN_Classifier(nn.Module):
 
         self.fc = nn.Linear(hidden_size, num_classes)
 
-    def forward(self, x, intervals):
+    def forward(self, batch):
         """
         Args:
             x: Input MFCC features of shape (batch_size, seq_len, feat_dim)
@@ -58,6 +58,8 @@ class CNN_RNN_Classifier(nn.Module):
             out: Classification logits of shape (batch_size, num_classes)
         """
         # CNN processing
+        x = batch['feats']
+        intervals = batch['intervals']
         x = x.permute(0, 2, 1)    # Conv1d receives (batch_size, feat_dim, seq_len)
         #print(f'Original Feats shape: {x.shape}')
         cnn_out = F.relu(self.conv1d_a(x))  # (batch_size, cnn_out_channels, seq_len)
@@ -87,5 +89,41 @@ class CNN_RNN_Classifier(nn.Module):
 
         # Classification
         out = self.fc(last_hidden_state)  # (batch_size, num_classes)
+
+        return out
+    
+class LSTM_spectrum(nn.Module):
+    def __init__(self,
+                 hidden_size,
+                 pair_emb_dim,
+                 num_classes,
+                 input_size=2,
+                 num_layers=2,
+                 dropout=0.3):
+        super(LSTM_spectrum, self).__init__()
+        self.pair_emb_dim = pair_emb_dim
+        
+        self.lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0
+        )
+
+        self.fc = nn.Sequential(
+            nn.Linear(hidden_size, pair_emb_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(pair_emb_dim, num_classes)
+            )
+
+    def forward(self, batch):
+        freqs = batch['spectrum_freq_bins']
+        env_spec = batch['envelope_spectrum']
+        x = torch.stack([freqs, env_spec], dim=-1)
+        lstm_out, (h_n, _) = self.lstm(x)
+        last_hidden_state = h_n[-1]
+        out = self.fc(last_hidden_state)
 
         return out

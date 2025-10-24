@@ -1,0 +1,19 @@
+{
+  "exp_name": "run_01_split",
+  "lmdb_path": "data/MSP/rtm_feats.lmdb",
+  "audio_source": "MSP",
+  "batch_size": 64,
+  "model_type": "cnn_rnn",
+  "model_params": {
+    "feat_dim": 13,
+    "kernel_size": 1,
+    "hidden_size": 512
+  },
+  "training_params": {
+    "learning_rate": 0.001,
+    "num_epochs": 1000,
+    "plot_every": 5,
+    "save_every": 10,
+    "early_stop_patience": 100
+  }
+}

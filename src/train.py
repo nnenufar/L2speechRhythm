@@ -9,7 +9,7 @@ from pathlib import Path
 import torch.optim as optim
 from datetime import datetime
 import matplotlib.pyplot as plt
-from src.models import CNN_RNN_Classifier, LSTM_spectrum
+from src.models import CNN_RNN_Classifier, LSTM_with_MultiHeadAttention, rhythm_spectrum_encoder
 from src.dataloaders import DatasetLMDB, collate_fn
 from torch.utils.data import DataLoader
 
@@ -18,7 +18,8 @@ timestamp = datetime.now().strftime('%Y%m%d_%H%M')
 
 MODEL_MAPPING = {
     "cnn_rnn": CNN_RNN_Classifier,
-    "lstm": LSTM_spectrum
+    "lstm": LSTM_with_MultiHeadAttention,
+    "spec_encoder": rhythm_spectrum_encoder,
 }
 
 def setup_experiment_dir(exp_name):
@@ -226,7 +227,6 @@ def train(config):
     logger.info("Initializing model...")
     model = MODEL_MAPPING.get(config['model_type'])(
         **config['model_params'],
-        num_classes=num_classes
     ).to(device)
     
     total_params = sum(p.numel() for p in model.parameters())
@@ -285,102 +285,104 @@ def train(config):
 
             optimizer.zero_grad()
             outputs = model(batch)
-            loss = criterion(outputs, labels)
-
-            loss.backward()
-            optimizer.step()
-            if use_scheduler:
-                scheduler.step()
-            
-            # Calculate metrics
-            train_loss += loss.item()
-            _, predicted = torch.max(outputs.data, 1)
-            train_total += labels.size(0)
-            train_correct += (predicted == labels).sum().item()
-        
-        # Training statistics
-        avg_train_loss = train_loss / len(train_loader)
-        train_accuracy = 100 * train_correct / train_total
-        
-        train_losses.append(avg_train_loss)
-        train_accs.append(train_accuracy)
-        
-        # Validation phase
-        logger.info(f"Epoch [{epoch+1}/{config['training_params']['num_epochs']}] - Validation")
-        val_loss, val_accuracy = evaluate(model, dev_loader, criterion, device, logger, "Development")
-        
-        val_losses.append(val_loss)
-        val_accs.append(val_accuracy)
-        
-        # Log epoch summary
-        logger.info("-"*70)
-        logger.info(f"Epoch [{epoch+1}/{config['training_params']['num_epochs']}] Summary:")
-        logger.info(f"  Train Loss: {avg_train_loss:.4f} | Train Acc: {train_accuracy:.2f}%")
-        logger.info(f"  Val Loss: {val_loss:.4f} | Val Acc: {val_accuracy:.2f}%")
-        if use_scheduler:
-            logger.info(f"  Learning Rate: {scheduler.get_last_lr()[0]:.6f} (Using Scheduler)")
-        else:
-            logger.info(f"  Learning Rate: {config['training_params']['learning_rate']:.6f} (Not using Scheduler)")
-        
-        # Check if best model (based on validation loss)
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            epochs_without_improvement = 0
-            logger.info(f"  New best validation loss: {best_val_loss:.4f}")
-            save_checkpoint(model, optimizer, epoch+1, avg_train_loss, train_accuracy, 
-                          val_loss, val_accuracy, checkpoints_dir, logger, is_best=True)
-        else:
-            epochs_without_improvement += 1
-        
-        if val_accuracy > best_val_acc:
-            best_val_acc = val_accuracy
-            logger.info(f"  New best validation accuracy: {best_val_acc:.2f}%")
-        
-        logger.info("-"*70 + "\n")
-        
-        # Early stopping check
-        if epochs_without_improvement >= early_stop_patience:
-            logger.info(f"Early stopping triggered after {early_stop_patience} epochs without improvement")
-            logger.info(f"Best validation loss: {best_val_loss:.4f}")
-            logger.info(f"Best validation accuracy: {best_val_acc:.2f}%")
             break
+        break
+    #         loss = criterion(outputs, labels)
+
+    #         loss.backward()
+    #         optimizer.step()
+    #         if use_scheduler:
+    #             scheduler.step()
+            
+    #         # Calculate metrics
+    #         train_loss += loss.item()
+    #         _, predicted = torch.max(outputs.data, 1)
+    #         train_total += labels.size(0)
+    #         train_correct += (predicted == labels).sum().item()
         
-        # Plot training curves periodically
-        if (epoch + 1) % plot_every == 0:
-            plot_file = plot_training_curves(train_losses, train_accs, val_losses, val_accs, 
-                                            plots_dir, timestamp)
-            logger.info(f"Training curves saved to {plot_file}\n")
+    #     # Training statistics
+    #     avg_train_loss = train_loss / len(train_loader)
+    #     train_accuracy = 100 * train_correct / train_total
         
-        # Save periodic checkpoint
-        if args.save_ckpt and (epoch + 1) % save_every == 0:
-            save_checkpoint(model, optimizer, epoch+1, avg_train_loss, train_accuracy, 
-                          val_loss, val_accuracy, checkpoints_dir, logger, is_best=False)
+    #     train_losses.append(avg_train_loss)
+    #     train_accs.append(train_accuracy)
+        
+    #     # Validation phase
+    #     logger.info(f"Epoch [{epoch+1}/{config['training_params']['num_epochs']}] - Validation")
+    #     val_loss, val_accuracy = evaluate(model, dev_loader, criterion, device, logger, "Development")
+        
+    #     val_losses.append(val_loss)
+    #     val_accs.append(val_accuracy)
+        
+    #     # Log epoch summary
+    #     logger.info("-"*70)
+    #     logger.info(f"Epoch [{epoch+1}/{config['training_params']['num_epochs']}] Summary:")
+    #     logger.info(f"  Train Loss: {avg_train_loss:.4f} | Train Acc: {train_accuracy:.2f}%")
+    #     logger.info(f"  Val Loss: {val_loss:.4f} | Val Acc: {val_accuracy:.2f}%")
+    #     if use_scheduler:
+    #         logger.info(f"  Learning Rate: {scheduler.get_last_lr()[0]:.6f} (Using Scheduler)")
+    #     else:
+    #         logger.info(f"  Learning Rate: {config['training_params']['learning_rate']:.6f} (Not using Scheduler)")
+        
+    #     # Check if best model (based on validation loss)
+    #     if val_loss < best_val_loss:
+    #         best_val_loss = val_loss
+    #         epochs_without_improvement = 0
+    #         logger.info(f"  New best validation loss: {best_val_loss:.4f}")
+    #         save_checkpoint(model, optimizer, epoch+1, avg_train_loss, train_accuracy, 
+    #                       val_loss, val_accuracy, checkpoints_dir, logger, is_best=True)
+    #     else:
+    #         epochs_without_improvement += 1
+        
+    #     if val_accuracy > best_val_acc:
+    #         best_val_acc = val_accuracy
+    #         logger.info(f"  New best validation accuracy: {best_val_acc:.2f}%")
+        
+    #     logger.info("-"*70 + "\n")
+        
+    #     # Early stopping check
+    #     if epochs_without_improvement >= early_stop_patience:
+    #         logger.info(f"Early stopping triggered after {early_stop_patience} epochs without improvement")
+    #         logger.info(f"Best validation loss: {best_val_loss:.4f}")
+    #         logger.info(f"Best validation accuracy: {best_val_acc:.2f}%")
+    #         break
+        
+    #     # Plot training curves periodically
+    #     if (epoch + 1) % plot_every == 0:
+    #         plot_file = plot_training_curves(train_losses, train_accs, val_losses, val_accs, 
+    #                                         plots_dir, timestamp)
+    #         logger.info(f"Training curves saved to {plot_file}\n")
+        
+    #     # Save periodic checkpoint
+    #     if args.save_ckpt and (epoch + 1) % save_every == 0:
+    #         save_checkpoint(model, optimizer, epoch+1, avg_train_loss, train_accuracy, 
+    #                       val_loss, val_accuracy, checkpoints_dir, logger, is_best=False)
     
-    # Final plot
-    plot_file = plot_training_curves(train_losses, train_accs, val_losses, val_accs, 
-                                    plots_dir, timestamp)
-    logger.info(f"\nFinal training curves saved to {plot_file}")
+    # # Final plot
+    # plot_file = plot_training_curves(train_losses, train_accs, val_losses, val_accs, 
+    #                                 plots_dir, timestamp)
+    # logger.info(f"\nFinal training curves saved to {plot_file}")
     
-    # Save final model
-    save_checkpoint(model, optimizer, len(train_losses), 
-                   train_losses[-1], train_accs[-1], val_losses[-1], val_accs[-1], 
-                   checkpoints_dir, logger, is_best=False)
+    # # Save final model
+    # save_checkpoint(model, optimizer, len(train_losses), 
+    #                train_losses[-1], train_accs[-1], val_losses[-1], val_accs[-1], 
+    #                checkpoints_dir, logger, is_best=False)
     
-    # Final evaluation on test set
-    logger.info("\n" + "="*70)
-    logger.info("Evaluating on test set...")
-    test_loss, test_accuracy = evaluate(model, test_loader, criterion, device, logger, "Test")
-    logger.info(f"Test Loss: {test_loss:.4f}")
-    logger.info(f"Test Accuracy: {test_accuracy:.2f}%")
+    # # Final evaluation on test set
+    # logger.info("\n" + "="*70)
+    # logger.info("Evaluating on test set...")
+    # test_loss, test_accuracy = evaluate(model, test_loader, criterion, device, logger, "Test")
+    # logger.info(f"Test Loss: {test_loss:.4f}")
+    # logger.info(f"Test Accuracy: {test_accuracy:.2f}%")
     
-    logger.info("\n" + "="*70)
-    logger.info("Training completed successfully!")
-    logger.info(f"  Best validation loss: {best_val_loss:.4f}")
-    logger.info(f"  Best validation accuracy: {best_val_acc:.2f}%")
-    logger.info(f"  Final test loss: {test_loss:.4f}")
-    logger.info(f"  Final test accuracy: {test_accuracy:.2f}%")
-    logger.info(f"  Experiment directory: {exp_dir}")
-    logger.info("="*70)
+    # logger.info("\n" + "="*70)
+    # logger.info("Training completed successfully!")
+    # logger.info(f"  Best validation loss: {best_val_loss:.4f}")
+    # logger.info(f"  Best validation accuracy: {best_val_acc:.2f}%")
+    # logger.info(f"  Final test loss: {test_loss:.4f}")
+    # logger.info(f"  Final test accuracy: {test_accuracy:.2f}%")
+    # logger.info(f"  Experiment directory: {exp_dir}")
+    # logger.info("="*70)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train a sequence classification model.")

@@ -1,19 +1,19 @@
 {
-  "exp_name": "run_05",
+  "exp_name": "C06",
   "batch_size": 64,
-  "model_type": "lstm",
+  "model_type": "spec_encoder",
   "model_params": {
-    "input_size": 2,
-    "hidden_size": 64,
-    "num_layers": 1,
-    "dropout": 0.3,
-    "pair_emb_dim": 64,
-    "num_heads": 2,
-    "bidirectional": true
+    "posEmb_dim": 64,
+    "cnn_out_channels": 128,
+    "cnn_kernel_size": 3,
+    "lstm_num_layers": 2,
+    "lstm_hidden_size": 32,
+    "max_audio_dur": 30,
+    "dropout": 0.3
   },
   "dataset_params": {
-    "lmdb_path": "data/MSP/rtm_feats.lmdb",
-    "data_source": "MSP",
+    "lmdb_path": "data/globo/rtm_feats.lmdb",
+    "data_source": "globo",
     "items": ["envelope_spectrum"]
   },
   "training_params": {

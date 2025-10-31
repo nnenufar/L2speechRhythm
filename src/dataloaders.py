@@ -3,11 +3,12 @@ from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
 from sklearn.model_selection import train_test_split
 import pandas as pd
+import os
 import numpy as np
 import pickle
 import lmdb
 
-data_sources = ['MSP']
+data_sources = ['MSP', 'globo', 'mtedx']
 
 def process_labels(labels: list):
     unique_labels = sorted(set(labels))
@@ -35,6 +36,11 @@ def collate_fn(batch):
             collated[key] = torch.stack(items, dim=0)
     
     return collated
+
+def subset_lmdb(env, keys_to_use):
+    with env.begin() as txn:
+        lmdb_keys = [key for key in txn.cursor().iternext(values=False) if key.decode('utf-8') in keys_to_use]
+        return lmdb_keys
 
 
 class DatasetLMDB(Dataset):
@@ -79,11 +85,43 @@ class DatasetLMDB(Dataset):
 
             self.labels = labels_df.set_index('FileName')['EmoClass'].to_dict()
 
-            with self.env.begin() as txn:
-                self.lmdb_keys = [key for key in txn.cursor().iternext(values=False) if key.decode('utf-8') in self.labels.keys()]
+            self.lmdb_keys = subset_lmdb(self.env, self.labels.keys())
 
-        # Not all audios have an associated label entry.
-        # Intersect keys to ensure we only use data that is present in both files.
+        if data_source == 'globo':
+            train_files, testValid_files = train_test_split(
+                os.listdir(f'data/{data_source}/wavs'),
+                test_size=self.test_size, # Default 80% train, 20% Valid+Test
+                random_state=self.random_seed
+            )
+            valid_files, test_files = train_test_split(
+                testValid_files,
+                test_size=0.5, # 10% valid, 10% test
+                random_state=self.random_seed
+            )
+
+            split_map = {"Train": train_files,
+                         "Development": valid_files,
+                         "Test": test_files}
+            
+            keys = split_map.get(self.split)
+            self.labels = {key:"J" for key in keys} # All files are assigned the same label
+            self.lmdb_keys = subset_lmdb(self.env, self.labels.keys())
+
+        if data_source == 'mtedx':
+            base_path = 'data/mtedx/'
+
+            train_files = os.listdir(base_path + 'train/wav')
+            valid_files = os.listdir(base_path + 'valid/wav')
+            test_files = os.listdir(base_path + 'test/wav')
+
+            split_map = {"Train": train_files,
+                         "Development": valid_files,
+                         "Test": test_files}
+            
+            keys = split_map.get(self.split)
+            self.labels = {key:"P" for key in keys} # All files are assigned the same label
+            self.lmdb_keys = subset_lmdb(self.env, self.labels.keys())
+
 
         self.labels_map = process_labels(list(self.labels.values()))
         self.labels_str2int = self.labels_map[0]

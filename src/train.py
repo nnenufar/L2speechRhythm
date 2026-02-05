@@ -2,14 +2,18 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import json
-import os
 import argparse
-import logging
-from pathlib import Path
 import torch.optim as optim
 from datetime import datetime
-import matplotlib.pyplot as plt
-from src.models import CNN_RNN_Classifier, LSTM_with_MultiHeadAttention, rhythm_spectrum_encoder
+from sklearn.metrics import f1_score
+from src import models
+from src.train_utils import (
+    setup_experiment_dir, setup_logger, plot_training_curves, 
+    save_checkpoint, create_weighted_sampler,
+    plot_attention_weights, plot_attention_summary,
+    plot_contrastive_embeddings
+)
+from src.modules import SupervisedContrastiveLoss
 from src.dataloaders import DatasetLMDB, collate_fn
 from torch.utils.data import DataLoader
 
@@ -17,138 +21,10 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 timestamp = datetime.now().strftime('%Y%m%d_%H%M')
 
 MODEL_MAPPING = {
-    "cnn_rnn": CNN_RNN_Classifier,
-    "lstm": LSTM_with_MultiHeadAttention,
-    "spec_encoder": rhythm_spectrum_encoder,
+    "cnn": models.CNN_MLP,
 }
 
-def setup_experiment_dir(exp_name):
-    """
-    Create experiment directory structure and return paths.
-    """
-    exp_dir = Path("exp") / exp_name
-    logs_dir = exp_dir / "logs"
-    plots_dir = exp_dir / "plots"
-    checkpoints_dir = exp_dir / "checkpoints"
-    
-    # Create directories
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    plots_dir.mkdir(parents=True, exist_ok=True)
-    checkpoints_dir.mkdir(parents=True, exist_ok=True)
-    
-    return exp_dir, logs_dir, plots_dir, checkpoints_dir
-
-def setup_logger(logs_dir, exp_name):
-    """
-    Setup logging configuration with both file and console handlers.
-    """
-    # Create logger
-    logger = logging.getLogger(exp_name)
-    logger.setLevel(logging.INFO)
-    
-    # Remove existing handlers to avoid duplicates
-    if logger.hasHandlers():
-        logger.handlers.clear()
-    
-    # Create formatters
-    file_formatter = logging.Formatter(
-        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
-    )
-    console_formatter = logging.Formatter(
-        '%(asctime)s - %(levelname)s - %(message)s',
-        datefmt='%H:%M:%S'
-    )
-    
-    # File handler - logs everything to file
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M')
-    log_file = logs_dir / f"training_{timestamp}.log"
-    file_handler = logging.FileHandler(log_file)
-    file_handler.setLevel(logging.INFO)
-    file_handler.setFormatter(file_formatter)
-    
-    # Console handler - logs to terminal
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
-    console_handler.setFormatter(console_formatter)
-    
-    # Add handlers to logger
-    logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
-    
-    logger.info(f"Logging to: {log_file}")
-    
-    return logger
-
-def plot_training_curves(train_losses, train_accs, val_losses, val_accs, plots_dir, timestamp):
-    """
-    Plot and save training curves (loss and accuracy).
-    """
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-    
-    # Plot loss
-    epochs_range = range(1, len(train_losses) + 1)
-    ax1.plot(epochs_range, train_losses, 'b-o', label='Training Loss', linewidth=2, markersize=4)
-    if val_losses:
-        ax1.plot(epochs_range, val_losses, 'r-s', label='Validation Loss', linewidth=2, markersize=4)
-    ax1.set_xlabel('Epoch', fontsize=12)
-    ax1.set_ylabel('Loss', fontsize=12)
-    ax1.set_title('Training and Validation Loss', fontsize=14, fontweight='bold')
-    ax1.legend(fontsize=10)
-    ax1.grid(True, alpha=0.3)
-    
-    # Plot accuracy
-    if train_accs:
-        ax2.plot(epochs_range, train_accs, 'b-o', label='Training Accuracy', linewidth=2, markersize=4)
-    if val_accs:
-        ax2.plot(epochs_range, val_accs, 'r-s', label='Validation Accuracy', linewidth=2, markersize=4)
-    ax2.set_xlabel('Epoch', fontsize=12)
-    ax2.set_ylabel('Accuracy (%)', fontsize=12)
-    ax2.set_title('Training and Validation Accuracy', fontsize=14, fontweight='bold')
-    ax2.legend(fontsize=10)
-    ax2.grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    
-    # Save plot
-    plot_file = plots_dir / f'training_curves_{timestamp}.png'
-    plt.savefig(plot_file, bbox_inches='tight')
-    plt.close()
-    
-    return plot_file
-
-def save_checkpoint(model, optimizer, epoch, train_loss, train_acc, val_loss, val_acc, 
-                   checkpoints_dir, logger, is_best=False):
-    """
-    Save model checkpoint.
-    """
-    checkpoint = {
-        'epoch': epoch,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'train_loss': train_loss,
-        'train_acc': train_acc,
-        'val_loss': val_loss,
-        'val_acc': val_acc,
-    }
-    
-    if is_best:
-        # Delete previous best model
-        for f in checkpoints_dir.glob("best_model_epoch*.pth"):
-            try:
-                os.remove(f)
-            except Exception as e:
-                logger.warning(f"Could not delete {f}: {e}")
-        # Save new best model
-        checkpoint_path = checkpoints_dir / f'best_model_epoch{epoch}.pth'
-        torch.save(checkpoint, checkpoint_path)
-        logger.info(f"Best model saved to {checkpoint_path}")
-    else:
-        checkpoint_path = checkpoints_dir / f'checkpoint_epoch{epoch}.pth'
-        torch.save(checkpoint, checkpoint_path)
-        logger.info(f"Checkpoint saved to {checkpoint_path}")
-
-def evaluate(model, dataloader, criterion, device, logger, split_name="Validation"):
+def evaluate(model, dataloader, criterion, device, logger, split_name="Development"):
     """
     Evaluate model on a given dataset.
     
@@ -163,34 +39,42 @@ def evaluate(model, dataloader, criterion, device, logger, split_name="Validatio
     Returns:
         avg_loss: Average loss over the dataset
         accuracy: Accuracy percentage
+        f1: F1 score
     """
     model.eval()
     total_loss = 0
     correct = 0
     total = 0
+    all_preds = []
+    all_labels = []
     
     with torch.no_grad():
         for batch in dataloader:
-            batch = {k: v.to(device) for k, v in batch.items()}
-            labels = batch['label']
+            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
+                    for k, v in batch.items()}
+            labels = batch['label']  # Keep as long for CrossEntropyLoss
             
             outputs = model(batch)
             loss = criterion(outputs, labels)
             
             total_loss += loss.item()
-            _, predicted = torch.max(outputs.data, 1)
+            _, predicted = torch.max(outputs, 1)  # Get class with highest score
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
+            
+            all_preds.extend(predicted.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
     
     avg_loss = total_loss / len(dataloader)
     accuracy = 100 * correct / total
+    f1 = f1_score(all_labels, all_preds, average='binary')
     
-    return avg_loss, accuracy
+    return avg_loss, accuracy, f1
 
 def train(config):
     # Setup experiment directories
     exp_name = config.get('exp_name')
-    exp_dir, logs_dir, plots_dir, checkpoints_dir = setup_experiment_dir(exp_name)
+    exp_dir, logs_dir, plots_dir, checkpoints_dir, att_plots_dir, contrastive_plots_dir = setup_experiment_dir(exp_name, timestamp)
     
     # Setup logger
     logger = setup_logger(logs_dir, exp_name)
@@ -211,12 +95,30 @@ def train(config):
     dev_dataset = DatasetLMDB(**config['dataset_params'], split='Development')
     test_dataset = DatasetLMDB(**config['dataset_params'], split='Test')
 
-    train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], 
-                            collate_fn=collate_fn, shuffle=True)
-    dev_loader = DataLoader(dev_dataset, batch_size=config['batch_size'], 
-                            collate_fn=collate_fn, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=config['batch_size'], 
-                            collate_fn=collate_fn, shuffle=False)
+    # Compute class distribution on train
+    from collections import Counter
+    train_label_counts = Counter(train_dataset.labels.values())
+    dev_label_counts = Counter(dev_dataset.labels.values())
+    test_label_counts = Counter(test_dataset.labels.values())
+    logger.info(f"Train class distribution: {dict(train_label_counts)}")
+
+    # Optional WeightedRandomSampler
+    use_weighted_sampler = config['training_params'].get('use_weighted_sampler', False)
+
+    if use_weighted_sampler:
+        train_sampler = create_weighted_sampler(train_dataset, train_label_counts)
+        train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], collate_fn=collate_fn, sampler=train_sampler)
+        dev_sampler = create_weighted_sampler(dev_dataset, dev_label_counts)
+        dev_loader = DataLoader(dev_dataset, batch_size=config['batch_size'], collate_fn=collate_fn, sampler=dev_sampler)
+        test_sampler = create_weighted_sampler(test_dataset, test_label_counts)
+        test_loader = DataLoader(test_dataset, batch_size=config['batch_size'], collate_fn=collate_fn, sampler=test_sampler)
+    else:
+        train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], 
+                                  collate_fn=collate_fn, shuffle=True)
+        dev_loader = DataLoader(dev_dataset, batch_size=config['batch_size'], 
+                                collate_fn=collate_fn, shuffle=False)
+        test_loader = DataLoader(test_dataset, batch_size=config['batch_size'], 
+                                collate_fn=collate_fn, shuffle=False)
     
     num_classes = len(train_dataset.labels_str2int)
     logger.info(f"Sucessfully loaded dataset\nNumber of classes: {num_classes}\nLabel mapping: {train_dataset.labels_str2int}")
@@ -235,8 +137,17 @@ def train(config):
     logger.info(f"Model: {config['model_type']} | Total parameters: {total_params:,} | "
                 f"Trainable parameters: {trainable_params:,} | Device: {device}")
     
-    # Loss and optimizer
+    # Use CrossEntropyLoss for multi-class classification
     criterion = nn.CrossEntropyLoss()
+    
+    # Check if using contrastive learning
+    use_contrastive = config['model_params'].get('use_contrastive', False)
+    if use_contrastive:
+        contrastive_weight = config['training_params'].get('contrastive_weight', 0.5)
+        contrastive_temp = config['training_params'].get('contrastive_temperature', 0.07)
+        contrastive_criterion = SupervisedContrastiveLoss(temperature=contrastive_temp)
+        logger.info(f"Using Supervised Contrastive Loss: weight={contrastive_weight}, temp={contrastive_temp}")
+
     optimizer = optim.Adam(
         model.parameters(),
         lr=config['training_params']['learning_rate'],
@@ -256,16 +167,25 @@ def train(config):
     
     # Training tracking
     train_losses = []
+    train_ce_losses = []  # Track CE loss separately when using contrastive
+    train_contrastive_losses = []  # Track contrastive loss separately
     train_accs = []
+    train_f1s = []
     val_losses = []
     val_accs = []
+    val_f1s = []
     best_val_loss = float('inf')
-    best_val_acc = 0.0
+    best_val_f1 = 0.0
     epochs_without_improvement = 0
     
     plot_every = config['training_params'].get('plot_every', 5)
     save_every = config['training_params'].get('save_every', 10)
+    use_early_stopping = config['training_params'].get('use_early_stopping', True)
     early_stop_patience = config['training_params'].get('early_stop_patience', 15)
+    
+    # Check if model uses attention (self-attention or attention pooling)
+    use_attention = config['model_params'].get('use_attention', False) or \
+                    config['model_params'].get('use_attention_pooling', False)
     
     logger.info("\n" + "="*70 + "Starting training" + "\n" + "="*70)
     
@@ -274,115 +194,200 @@ def train(config):
         # Training phase
         model.train()
         train_loss = 0
+        train_ce_loss = 0
+        train_con_loss = 0
         train_correct = 0
         train_total = 0
+        all_train_preds = []
+        all_train_labels = []
         
         logger.info(f"Epoch [{epoch+1}/{config['training_params']['num_epochs']}] - Training")
         
         for batch in train_loader:
-            batch = {k: v.to(device) for k, v in batch.items()}
-            labels = batch['label']
+            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
+                    for k, v in batch.items()}
+            labels = batch['label']  # Keep as long for CrossEntropyLoss
 
             optimizer.zero_grad()
-            outputs = model(batch)
-            break
-        break
-    #         loss = criterion(outputs, labels)
-
-    #         loss.backward()
-    #         optimizer.step()
-    #         if use_scheduler:
-    #             scheduler.step()
             
-    #         # Calculate metrics
-    #         train_loss += loss.item()
-    #         _, predicted = torch.max(outputs.data, 1)
-    #         train_total += labels.size(0)
-    #         train_correct += (predicted == labels).sum().item()
+            # Forward pass with optional contrastive embeddings
+            if use_contrastive:
+                outputs, embeddings = model(batch, return_embeddings=True)
+                ce_loss = criterion(outputs, labels)
+                contrastive_loss = contrastive_criterion(embeddings, labels)
+                
+                # Handle potential NaN in contrastive loss (can happen with small batches)
+                if torch.isnan(contrastive_loss) or torch.isinf(contrastive_loss):
+                    loss = ce_loss
+                    contrastive_loss_val = 0.0
+                else:
+                    loss = ce_loss + contrastive_weight * contrastive_loss
+                    contrastive_loss_val = contrastive_loss.item()
+                
+                train_ce_loss += ce_loss.item()
+                train_con_loss += contrastive_loss_val
+            else:
+                outputs = model(batch)
+                loss = criterion(outputs, labels)
+
+            loss.backward()
+            
+            # Gradient clipping to prevent exploding gradients
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            optimizer.step()
+            if use_scheduler:
+                scheduler.step()
+            
+            # Calculate metrics
+            train_loss += loss.item()
+            _, predicted = torch.max(outputs, 1)  # Get class with highest score
+            train_total += labels.size(0)
+            train_correct += (predicted == labels).sum().item()
+            all_train_preds.extend(predicted.cpu().numpy())
+            all_train_labels.extend(labels.cpu().numpy())
         
-    #     # Training statistics
-    #     avg_train_loss = train_loss / len(train_loader)
-    #     train_accuracy = 100 * train_correct / train_total
+        # Training statistics
+        avg_train_loss = train_loss / len(train_loader)
+        train_accuracy = 100 * train_correct / train_total
+        train_f1 = f1_score(all_train_labels, all_train_preds, average='binary')
         
-    #     train_losses.append(avg_train_loss)
-    #     train_accs.append(train_accuracy)
+        train_losses.append(avg_train_loss)
+        train_accs.append(train_accuracy)
+        train_f1s.append(train_f1)
         
-    #     # Validation phase
-    #     logger.info(f"Epoch [{epoch+1}/{config['training_params']['num_epochs']}] - Validation")
-    #     val_loss, val_accuracy = evaluate(model, dev_loader, criterion, device, logger, "Development")
+        # Track separate losses for contrastive learning
+        if use_contrastive:
+            avg_ce_loss = train_ce_loss / len(train_loader)
+            avg_con_loss = train_con_loss / len(train_loader)
+            train_ce_losses.append(avg_ce_loss)
+            train_contrastive_losses.append(avg_con_loss)
         
-    #     val_losses.append(val_loss)
-    #     val_accs.append(val_accuracy)
+        # Validation phase
+        logger.info(f"Epoch [{epoch+1}/{config['training_params']['num_epochs']}] - Validation")
+        val_loss, val_accuracy, val_f1 = evaluate(model, dev_loader, criterion, device, logger, "Development")
         
-    #     # Log epoch summary
-    #     logger.info("-"*70)
-    #     logger.info(f"Epoch [{epoch+1}/{config['training_params']['num_epochs']}] Summary:")
-    #     logger.info(f"  Train Loss: {avg_train_loss:.4f} | Train Acc: {train_accuracy:.2f}%")
-    #     logger.info(f"  Val Loss: {val_loss:.4f} | Val Acc: {val_accuracy:.2f}%")
-    #     if use_scheduler:
-    #         logger.info(f"  Learning Rate: {scheduler.get_last_lr()[0]:.6f} (Using Scheduler)")
-    #     else:
-    #         logger.info(f"  Learning Rate: {config['training_params']['learning_rate']:.6f} (Not using Scheduler)")
+        val_losses.append(val_loss)
+        val_accs.append(val_accuracy)
+        val_f1s.append(val_f1)
         
-    #     # Check if best model (based on validation loss)
-    #     if val_loss < best_val_loss:
-    #         best_val_loss = val_loss
-    #         epochs_without_improvement = 0
-    #         logger.info(f"  New best validation loss: {best_val_loss:.4f}")
-    #         save_checkpoint(model, optimizer, epoch+1, avg_train_loss, train_accuracy, 
-    #                       val_loss, val_accuracy, checkpoints_dir, logger, is_best=True)
-    #     else:
-    #         epochs_without_improvement += 1
+        # Log epoch summary
+        logger.info("-"*70)
+        logger.info(f"Epoch [{epoch+1}/{config['training_params']['num_epochs']}] Summary:")
+        if use_contrastive:
+            logger.info(f"  Train Loss: {avg_train_loss:.4f} (CE: {avg_ce_loss:.4f}, Contrastive: {avg_con_loss:.4f})")
+        else:
+            logger.info(f"  Train Loss: {avg_train_loss:.4f}")
+        logger.info(f"  Train Acc: {train_accuracy:.2f}% | Train F1: {train_f1:.4f}")
+        logger.info(f"  Val Loss: {val_loss:.4f} | Val Acc: {val_accuracy:.2f}% | Val F1: {val_f1:.4f}")
+        if use_scheduler:
+            logger.info(f"  Learning Rate: {scheduler.get_last_lr()[0]:.6f} (Using Scheduler)")
+        else:
+            logger.info(f"  Learning Rate: {config['training_params']['learning_rate']:.6f} (Not using Scheduler)")
         
-    #     if val_accuracy > best_val_acc:
-    #         best_val_acc = val_accuracy
-    #         logger.info(f"  New best validation accuracy: {best_val_acc:.2f}%")
+        # Check if best model (based on validation F1 score)
+        if val_f1 > best_val_f1:
+            best_val_f1 = val_f1
+            epochs_without_improvement = 0
+            logger.info(f"  New best validation F1: {best_val_f1:.4f}")
+            save_checkpoint(model, optimizer, epoch+1, avg_train_loss, train_accuracy, 
+                          val_loss, val_accuracy, checkpoints_dir, logger, is_best=True)
+        else:
+            epochs_without_improvement += 1
         
-    #     logger.info("-"*70 + "\n")
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            logger.info(f"  New best validation loss: {best_val_loss:.4f}")
         
-    #     # Early stopping check
-    #     if epochs_without_improvement >= early_stop_patience:
-    #         logger.info(f"Early stopping triggered after {early_stop_patience} epochs without improvement")
-    #         logger.info(f"Best validation loss: {best_val_loss:.4f}")
-    #         logger.info(f"Best validation accuracy: {best_val_acc:.2f}%")
-    #         break
+        logger.info("-"*70 + "\n")
         
-    #     # Plot training curves periodically
-    #     if (epoch + 1) % plot_every == 0:
-    #         plot_file = plot_training_curves(train_losses, train_accs, val_losses, val_accs, 
-    #                                         plots_dir, timestamp)
-    #         logger.info(f"Training curves saved to {plot_file}\n")
+        # Early stopping check
+        if use_early_stopping and epochs_without_improvement >= early_stop_patience:
+            logger.info(f"Early stopping triggered after {early_stop_patience} epochs without improvement")
+            logger.info(f"Best validation loss: {best_val_loss:.4f}")
+            logger.info(f"Best validation F1: {best_val_f1:.4f}")
+            break
         
-    #     # Save periodic checkpoint
-    #     if args.save_ckpt and (epoch + 1) % save_every == 0:
-    #         save_checkpoint(model, optimizer, epoch+1, avg_train_loss, train_accuracy, 
-    #                       val_loss, val_accuracy, checkpoints_dir, logger, is_best=False)
+        # Plot training curves periodically
+        if (epoch + 1) % plot_every == 0:
+            plot_file = plot_training_curves(train_losses, train_accs, train_f1s, 
+                                            val_losses, val_accs, val_f1s,
+                                            plots_dir, timestamp)
+            logger.info(f"Training curves saved to {plot_file}\n")
+            
+            # Plot attention weights if model uses attention
+            if use_attention:
+                model.eval()
+                with torch.no_grad():
+                    # Get a batch from validation set for attention visualization
+                    val_batch = next(iter(dev_loader))
+                    val_batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
+                                for k, v in val_batch.items()}
+                    val_labels = val_batch['label']
+                    
+                    outputs, attn_weights = model(val_batch, return_attention=True)
+                    _, val_preds = torch.max(outputs, 1)
+                    
+                    # Plot individual attention maps
+                    att_plot_file = plot_attention_weights(
+                        attn_weights, val_labels, val_preds, 
+                        att_plots_dir, epoch+1, num_samples=4, timestamp=timestamp
+                    )
+                    logger.info(f"Attention weights saved to {att_plot_file}")
+                    
+                    # Plot attention summary by class
+                    att_summary_file = plot_attention_summary(
+                        attn_weights, val_labels,
+                        att_plots_dir, epoch+1, timestamp=timestamp
+                    )
+                    logger.info(f"Attention summary saved to {att_summary_file}\n")
+                model.train()
+            
+            # Plot contrastive embeddings if using contrastive learning
+            if use_contrastive:
+                emb_plot_file, emb_metrics = plot_contrastive_embeddings(
+                    model, dev_loader, device, contrastive_plots_dir, epoch+1,
+                    labels_int2str=train_dataset.labels_int2str,
+                    timestamp=timestamp, max_samples=500
+                )
+                logger.info(f"Contrastive embeddings saved to {emb_plot_file}")
+                logger.info(f"  Silhouette: {emb_metrics['silhouette_score']:.4f} | "
+                           f"Sep Ratio: {emb_metrics['separation_ratio']:.4f}\n")
+                model.train()
+        
+        # Save periodic checkpoint
+        if args.save_ckpt and (epoch + 1) % save_every == 0:
+            save_checkpoint(model, optimizer, epoch+1, avg_train_loss, train_accuracy, 
+                          val_loss, val_accuracy, checkpoints_dir, logger, is_best=False)
     
-    # # Final plot
-    # plot_file = plot_training_curves(train_losses, train_accs, val_losses, val_accs, 
-    #                                 plots_dir, timestamp)
-    # logger.info(f"\nFinal training curves saved to {plot_file}")
+    # Final plot
+    plot_file = plot_training_curves(train_losses, train_accs, train_f1s,
+                                    val_losses, val_accs, val_f1s,
+                                    plots_dir, timestamp)
+    logger.info(f"\nFinal training curves saved to {plot_file}")
     
-    # # Save final model
-    # save_checkpoint(model, optimizer, len(train_losses), 
-    #                train_losses[-1], train_accs[-1], val_losses[-1], val_accs[-1], 
-    #                checkpoints_dir, logger, is_best=False)
+    # Save final model
+    save_checkpoint(model, optimizer, len(train_losses), 
+                   train_losses[-1], train_accs[-1], val_losses[-1], val_accs[-1], 
+                   checkpoints_dir, logger, is_best=False)
     
-    # # Final evaluation on test set
-    # logger.info("\n" + "="*70)
-    # logger.info("Evaluating on test set...")
-    # test_loss, test_accuracy = evaluate(model, test_loader, criterion, device, logger, "Test")
-    # logger.info(f"Test Loss: {test_loss:.4f}")
-    # logger.info(f"Test Accuracy: {test_accuracy:.2f}%")
+    # Final evaluation on test set
+    logger.info("\n" + "="*70)
+    logger.info("Evaluating on test set...")
+    test_loss, test_accuracy, test_f1 = evaluate(model, test_loader, criterion, device, logger, "Test")
+    logger.info(f"Test Loss: {test_loss:.4f}")
+    logger.info(f"Test Accuracy: {test_accuracy:.2f}%")
+    logger.info(f"Test F1: {test_f1:.4f}")
     
-    # logger.info("\n" + "="*70)
-    # logger.info("Training completed successfully!")
-    # logger.info(f"  Best validation loss: {best_val_loss:.4f}")
-    # logger.info(f"  Best validation accuracy: {best_val_acc:.2f}%")
-    # logger.info(f"  Final test loss: {test_loss:.4f}")
-    # logger.info(f"  Final test accuracy: {test_accuracy:.2f}%")
-    # logger.info(f"  Experiment directory: {exp_dir}")
-    # logger.info("="*70)
+    logger.info("\n" + "="*70)
+    logger.info("Training completed successfully!")
+    logger.info(f"  Best validation loss: {best_val_loss:.4f}")
+    logger.info(f"  Best validation F1: {best_val_f1:.4f}")
+    logger.info(f"  Final test loss: {test_loss:.4f}")
+    logger.info(f"  Final test accuracy: {test_accuracy:.2f}%")
+    logger.info(f"  Final test F1: {test_f1:.4f}")
+    logger.info(f"  Experiment directory: {exp_dir}")
+    logger.info("="*70)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train a sequence classification model.")

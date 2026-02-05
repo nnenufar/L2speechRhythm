@@ -1,239 +1,146 @@
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
+from src.modules import *
+from src.train_utils import quantize_values
 
-class CNN_RNN_Classifier(nn.Module):
+class CNN_MLP(nn.Module):
     """
-    A hybrid model combining CNN for feature extraction and RNN for sequence modeling.
-    Includes interval concatenation for temporal context awareness.
+    CNN feature extraction with pooling and fully connected classification head.
+    Optionally supports supervised contrastive learning.
     """
     def __init__(self,
                  feat_dim,
-                 kernel_size,
-                 hidden_size,
-                 num_classes, 
-                 cnn_out_channels=None,
-                 num_lstm_layers=2,
-                 dropout=0.1):
-        super(CNN_RNN_Classifier, self).__init__()
-
-        self.cnn_out_channels = cnn_out_channels if cnn_out_channels else feat_dim * 2
-        self.dropout = nn.Dropout(dropout)
-
-        self.conv1d_a = nn.Conv1d(
-            in_channels=feat_dim, 
-            out_channels=self.cnn_out_channels,
-            kernel_size=kernel_size,
-            padding='valid' # No padding, already performed by the collate function 
-        )
-        self.batch_norm_a = nn.BatchNorm1d(num_features=self.cnn_out_channels)
-
-        self.conv1d_b = nn.Conv1d(
-            in_channels=self.cnn_out_channels, 
-            out_channels=self.cnn_out_channels,
-            kernel_size=kernel_size,
-            padding='valid' 
-        )
-        self.batch_norm_b = nn.BatchNorm1d(num_features=self.cnn_out_channels)
-
-        # LSTM layer to process the sequence of features from the CNN
-        # Input size is CNN output channels + 1 (for the interval feature)
-        self.lstm = nn.LSTM(
-            input_size=self.cnn_out_channels + 1,
-            hidden_size=hidden_size,
-            num_layers=num_lstm_layers,
-            batch_first=True,
-            dropout=dropout if num_lstm_layers > 1 else 0
-        )
-
-        self.fc = nn.Linear(hidden_size, num_classes)
-
-    def forward(self, batch):
-        """
-        Args:
-            x: Input MFCC features of shape (batch_size, seq_len, feat_dim)
-            interval: Float tensor of shape (batch_size, seq_len)
-        
-        Returns:
-            out: Classification logits of shape (batch_size, num_classes)
-        """
-        # CNN processing
-        x = batch['feats']
-        intervals = batch['intervals']
-        x = x.permute(0, 2, 1)    # Conv1d receives (batch_size, feat_dim, seq_len)
-        #print(f'Original Feats shape: {x.shape}')
-        cnn_out = F.relu(self.conv1d_a(x))  # (batch_size, cnn_out_channels, seq_len)
-        cnn_out = self.dropout(self.batch_norm_a(cnn_out))
-
-        cnn_out = F.relu(self.conv1d_b(cnn_out))
-        cnn_out = self.dropout(self.batch_norm_b(cnn_out))  
-        
-        # Reshape CNN feats for LSTM: (batch_size, seq_len, cnn_out_channels)
-        rnn_input = cnn_out.permute(0, 2, 1)
-        #print(f'RNN input: {rnn_input[0]}')
-        #print(f'shape: {rnn_input.shape}')
-
-        # Reshape intervals for concat
-        intervals = intervals.unsqueeze(2)
-        #print(f'Intervals shape: {intervals.shape}')
-        
-        # Concatenate interval with CNN features along the feature dimension
-        rnn_input = torch.cat([rnn_input, intervals], dim=2)
-
-        # LSTM processing
-        lstm_out, (h_n, _) = self.lstm(rnn_input)
-        # h_n shape: (num_layers, batch_size, hidden_size)
-
-        last_hidden_state = h_n[-1]  # (batch_size, hidden_size)
-        last_hidden_state = self.dropout(last_hidden_state)
-
-        # Classification
-        out = self.fc(last_hidden_state)  # (batch_size, num_classes)
-
-        return out
-    
-class LSTM_with_MultiHeadAttention(nn.Module):
-    def __init__(self,
-                 hidden_size,
-                 pair_emb_dim,
+                 kernel_size, # CNN
+                 hidden_size, # Classification head
                  num_classes,
-                 dropout,
-                 bidirectional,
-                 input_size,
-                 num_layers,
-                 num_heads):
+                 cnn_out_channels=None,
+                 num_cnn_layers=3,
+                 use_attention_pooling=False,
+                 attn_hidden_dim=None,                 
+                 pooling_mode='both', # Only used if attPool is False
+                 dropout=0.1,
+                 # Contrastive learning parameters
+                 use_contrastive=False,
+                 proj_hidden_dim=64,
+                 proj_out_dim=32,
+                 proj_num_layers=2,
+                 # Duration embedding parameters
+                 use_duration=False,
+                 dur_mean=None,
+                 dur_std=None,
+                 dur_num_bins=32,
+                 dur_min_val=-3.0,
+                 dur_max_val=3.0,
+                 main_item=None):
         super().__init__()
-        self.hidden_size = hidden_size
-        self.num_directions = 2 if bidirectional else 1
-        self.embedding_dim = hidden_size * self.num_directions
 
-        # --- LSTM backbone ---
-        self.lstm = nn.LSTM(
-            input_size=input_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            batch_first=True,
+        self.main_item = main_item
+        self.cnn_out_channels = cnn_out_channels if cnn_out_channels else feat_dim * 2
+        self.use_attention_pooling = use_attention_pooling
+        self.use_contrastive = use_contrastive
+        self.use_duration = use_duration
+
+        # CNN Encoder
+        self.cnn_encoder = Conv1dStack(
+            in_channels=feat_dim,
+            hidden_channels=self.cnn_out_channels,
+            out_channels=self.cnn_out_channels,
+            kernel_size=kernel_size,
+            num_layers=num_cnn_layers,
+            activation='relu',
             dropout=dropout,
-            bidirectional=bidirectional
+            norm='layer'
         )
 
-        # --- Multi-head self-attention ---
-        # Note: embedding_dim must be divisible by num_heads
-        self.self_attn = nn.MultiheadAttention(
-            embed_dim=self.embedding_dim,
-            num_heads=num_heads,
+        # Pooling
+        if use_attention_pooling:
+            self.attn_pool = AttentionPooling(
+                embed_dim=self.cnn_out_channels,
+                hidden_dim=attn_hidden_dim,
+                dropout=dropout)
+            self.embed_dim = self.cnn_out_channels
+        else:
+            self.pooling = GlobalPooling(mode=pooling_mode)
+            self.embed_dim = self.cnn_out_channels * 2 if pooling_mode == 'both' else self.cnn_out_channels
+
+        # Duration embedding
+        if use_duration:
+            assert dur_mean is not None and dur_std is not None, \
+                "dur_mean and dur_std must be provided when use_duration=True"
+            self.register_buffer('dur_mean', torch.tensor(dur_mean, dtype=torch.float32))
+            self.register_buffer('dur_std', torch.tensor(dur_std, dtype=torch.float32))
+            self.dur_num_bins = dur_num_bins
+            self.dur_min_val = dur_min_val
+            self.dur_max_val = dur_max_val
+            
+            # Duration embedding: maps quantized duration to embed_dim
+            self.dur_embedding = nn.Embedding(dur_num_bins, self.embed_dim)
+            self.dur_layer_norm = nn.LayerNorm(self.embed_dim)
+
+        # Classification head
+        self.fc = MLP(
+            in_features=self.embed_dim,
+            hidden_features=hidden_size,
+            out_features=num_classes,
+            num_layers=1,
+            activation='relu',
             dropout=dropout,
-            batch_first=True
+            norm='layer'
         )
-
-        # --- Feed-forward classification head ---
-        self.fc = nn.Sequential(
-            nn.Linear(self.embedding_dim * 2, pair_emb_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(pair_emb_dim, num_classes)
-        )
-
-        # Optional: normalization for stability
-        self.norm1 = nn.LayerNorm(self.embedding_dim)
-        self.norm2 = nn.LayerNorm(self.embedding_dim)
-
-    def forward(self, batch):
-        freqs = batch['spectrum_freq_bins']
-        env_spec = batch['envelope_spectrum']
-        x = torch.stack([freqs, env_spec], dim=-1)  # (B, T, 2)
-
-        # --- LSTM encoding ---
-        lstm_out, _ = self.lstm(x)  # (B, T, H*D)
-        lstm_out = self.norm1(lstm_out)
-
-        # --- Multi-head self-attention ---
-        attn_out, attn_weights = self.self_attn(lstm_out, lstm_out, lstm_out)
-        attn_out = self.norm2(attn_out + lstm_out)  # residual connection
-
-        # --- Pooling ---
-        avg_pool = torch.mean(attn_out, dim=1)
-        max_pool, _ = torch.max(attn_out, dim=1)
-        pooled = torch.cat([avg_pool, max_pool], dim=1)
-
-        # --- Classification ---
-        out = self.fc(pooled)
-
-        return out # attn_weights can be visualized later
-    
-class rhythm_spectrum_encoder(nn.Module):
-    def __init__(self,
-                posEmb_dim,
-                cnn_out_channels,
-                cnn_kernel_size,
-                lstm_num_layers,
-                lstm_hidden_size,
-                dropout,
-                max_audio_dur = 30,
-                sr=16000):
-        super().__init__()
-        self.dropout = nn.Dropout(dropout)
-        max_num_samples = sr * max_audio_dur
-        max_num_freq_bins = int(10 * max_num_samples / sr) + 1
-        print(f"Max num freq bins: {max_num_freq_bins}")
-
-        # Encode freq bins as positional embeddings
-        self.posEmb = nn.Embedding(max_num_freq_bins, posEmb_dim)
-
-        self.conv1d_a = nn.Conv1d(
-            in_channels=1, 
-            out_channels=cnn_out_channels,
-            kernel_size=cnn_kernel_size,
-            padding='valid' # No padding, already performed by the collate function 
-        )
-        self.batch_norm_a = nn.BatchNorm1d(num_features=cnn_out_channels)
-
-        self.conv1d_b = nn.Conv1d(
-            in_channels=cnn_out_channels, 
-            out_channels=cnn_out_channels,
-            kernel_size=cnn_kernel_size,
-            padding='valid' 
-        )
-        self.batch_norm_b = nn.BatchNorm1d(num_features=cnn_out_channels)
-
-        # LSTM layer to process the sequence of features from the CNN
-        # Input size is CNN output channels + 1 (for the interval feature)
-        self.lstm = nn.LSTM(
-            input_size=cnn_out_channels + 1,
-            hidden_size=lstm_hidden_size,
-            num_layers=lstm_num_layers,
-            batch_first=True,
-            dropout=dropout if lstm_num_layers > 1 else 0
-        )
-
-    def forward(self, batch):
-        # CNN processing
-        x = batch['envelope_spectrum'].unsqueeze(1)  # (batch_size, 1, num_freq_bins)
-        # Conv1d receives (batch_size, feat_dim, seq_len)
-        print(f'Original envSpec shape: {x.shape}')
-        cnn_out = F.relu(self.conv1d_a(x))  # (batch_size, cnn_out_channels, seq_len)
-        cnn_out = self.dropout(self.batch_norm_a(cnn_out))
-        cnn_out = F.relu(self.conv1d_b(cnn_out))
-        cnn_out = self.dropout(self.batch_norm_b(cnn_out))
-
-        freq_bins = batch['spectrum_freq_bins']
-        pos_embs = self.posEmb(freq_bins)
         
-        # Reshape CNN feats for LSTM: (batch_size, seq_len, cnn_out_channels)
-        rnn_input = cnn_out.permute(0, 2, 1)
-        #print(f'RNN input: {rnn_input[0]}')
-        #print(f'shape: {rnn_input.shape}')
+        # Projection head for contrastive learning
+        if use_contrastive:
+            self.projection_head = ProjectionHead(
+                in_dim=self.embed_dim,
+                hidden_dim=proj_hidden_dim,
+                out_dim=proj_out_dim,
+                num_layers=proj_num_layers,
+                dropout=dropout
+            )
 
-        # Reshape intervals for concat
-        pos_embs = pos_embs.unsqueeze(2)
-        #print(f'Intervals shape: {intervals.shape}')
+    def forward(self, batch, return_attention=False, return_embeddings=False):
+        x = batch[self.main_item]       # (B, T)
+        x = x.unsqueeze(1)                   # (B, 1, T)
+
+        cnn_out = self.cnn_encoder(x)        # (B, C, T)
+        cnn_out = cnn_out.permute(0, 2, 1)   # (B, T, C)
+
+        attn_weights = None
+        if self.use_attention_pooling:
+            pooled, attn_weights = self.attn_pool(cnn_out)  # (B, C), (B, T)
+            embeddings = pooled
+        else:
+            embeddings = self.pooling(cnn_out)  # (B, C) or (B, 2C)
+
+        # Add duration embedding if enabled
+        if self.use_duration:
+            dur = batch['dur']  # (B,)
+            dur_bins = quantize_values(
+                dur, 
+                mean=self.dur_mean, 
+                std=self.dur_std,
+                num_bins=self.dur_num_bins,
+                min_val=self.dur_min_val,
+                max_val=self.dur_max_val
+            )  # (B,)
+            dur_emb = self.dur_embedding(dur_bins)  # (B, embed_dim)
+            dur_emb = self.dur_layer_norm(dur_emb)
+            embeddings = embeddings + dur_emb  # (B, embed_dim)
+
+        logits = self.fc(embeddings)
         
-        # Concatenate interval with CNN features along the feature dimension
-        rnn_input = torch.cat([rnn_input, pos_embs], dim=2)
-
-        # LSTM processing
-        lstm_out, (h_n, _) = self.lstm(rnn_input)
-        # h_n shape: (num_layers, batch_size, hidden_size)
-
-        last_hidden_state = h_n[-1]  # (batch_size, hidden_size)
-        last_hidden_state = self.dropout(last_hidden_state)
+        # Build return values
+        outputs = [logits]
+        
+        if return_embeddings and self.use_contrastive:
+            projected = self.projection_head(embeddings)
+            outputs.append(projected)
+        
+        if return_attention and attn_weights is not None:
+            outputs.append(attn_weights)
+        
+        # Return single value if only logits, otherwise tuple
+        if len(outputs) == 1:
+            return outputs[0]
+        return tuple(outputs)

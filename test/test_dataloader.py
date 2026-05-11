@@ -1,10 +1,10 @@
-from src.dataloaders import DatasetLMDB, collate_fn
+from src.dataloaders import DatasetLMDB, collate_fn, processor_ssl
 from torch.utils.data import DataLoader
 from src import train_utils
 from collections import Counter
 import torch
 
-items = ['envelope_spectrum', 'spectrum_freq_bins']
+items = ['waveform']
 splits = ['Train', 'Development', 'Test']
 
 print("="*70)
@@ -16,7 +16,7 @@ for split in splits:
     print(f"Split: {split}")
     print("="*70)
     
-    dataset = DatasetLMDB('data/arctic/rtm_feats.lmdb', data_source='arctic', split=split, items=items)
+    dataset = DatasetLMDB('data/arctic/rtm_feats_bark_f0_egemaps.lmdb', data_source='arctic_regression', split=split, items=items)
     
     print(f"Number of samples: {len(dataset)}")
     print(f"Unique speakers: {len(dataset.speaker_str2int)}")
@@ -31,15 +31,19 @@ for split in splits:
     print(f"Speakers: {list(dataset.speaker_str2int.keys())}")
 
 print("\n" + "="*70)
-print("Batch Test (Train split with weighted sampler)")
+print("Batch Test (Train split)")
 print("="*70)
 
-# Test batch loading with Train split
-dataset = DatasetLMDB('data/arctic/rtm_feats.lmdb', data_source='arctic', split='Train', items=items)
-str_counts = Counter(dataset.labels.values())
-sampler = train_utils.create_weighted_sampler(dataset, str_counts)
+collateFunc = processor_ssl if 'waveform' in items else collate_fn
 
-dataloader = DataLoader(dataset, batch_size=32, collate_fn=collate_fn, sampler=sampler)
+# Test batch loading with Train split
+dataset = DatasetLMDB('data/arctic/rtm_feats_bark_f0_egemaps.lmdb', data_source='arctic_regression', split='Train', items=items)
+#sampler = train_utils.create_weighted_sampler(dataset, str_counts)
+str_counts = Counter(dataset.labels.values())
+
+# Note: Weighted sampler is not supported for regression tasks
+# For regression, just use shuffle=True
+dataloader = DataLoader(dataset, batch_size=32, collate_fn=collateFunc, shuffle=True) #sampler=sampler
 batch = next(iter(dataloader))
 print(dataset[0])
 

@@ -23,6 +23,8 @@ df_wavs["spkID"] = df_wavs["path"].str.split("/").str[-2]
 # Build identifier: "<spkID>_<filename>"
 df_wavs["identifier"] = df_wavs["spkID"] + "_" + df_wavs["path"].str.split("/").str[-1]
 
+df_wavs["uttID"] = df_wavs["identifier"].str.split("_").str[-1].str.replace(".wav", "")
+
 df_metadata = pd.read_csv("data/arctic/spks.csv")
 
 df_merged = df_wavs.merge(df_metadata, on="spkID", how="left")

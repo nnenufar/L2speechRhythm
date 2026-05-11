@@ -3,12 +3,13 @@ from src.dataloaders import DatasetLMDB
 import json
 from pathlib import Path
 
-DATASET_PATH = 'data/arctic/rtm_feats.lmdb'
+DATASET_PATH = 'data/arctic/rtm_feats_bark_f0.lmdb'
 DATA_SOURCE = 'arctic'
-ITEMS = ['dur']
+ITEMS = ['f0', 'voiced_mask']
 SPLIT = 'Train'
 
 def main():
+    #TODO: add normalization for pitch?
     dataset_path = DATASET_PATH
     data_source = DATA_SOURCE
     items = ITEMS

@@ -11,34 +11,42 @@ def setup_experiment_dir(exp_name, timestamp=None):
     
     Args:
         exp_name: Name of the experiment
-        timestamp: Optional timestamp string for attention plots subdirectory
+        timestamp: Optional timestamp string for subdirectories
     
     Returns:
-        exp_dir, logs_dir, plots_dir, checkpoints_dir, att_plots_dir, contrastive_plots_dir
+        dict with keys: exp_dir, logs_dir, plots_dir, checkpoints_dir, 
+                        att_plots_dir, test_results_dir
     """
     exp_dir = Path("exp") / exp_name
     logs_dir = exp_dir / "logs"
     plots_dir = exp_dir / "plots"
-    checkpoints_dir = exp_dir / "checkpoints"
     
-    # Create timestamped subdirectory for attention plots
+    # Create timestamped subdirectories
     if timestamp is None:
         timestamp = datetime.now().strftime('%Y%m%d_%H%M')
+    checkpoints_dir = exp_dir / "checkpoints" / timestamp
     att_plots_dir = exp_dir / "att_plots" / timestamp
-    contrastive_plots_dir = exp_dir / "contrastive_plots" / timestamp
+    test_results_dir = exp_dir / "test_results" / timestamp
     
     # Create directories
     logs_dir.mkdir(parents=True, exist_ok=True)
     plots_dir.mkdir(parents=True, exist_ok=True)
     checkpoints_dir.mkdir(parents=True, exist_ok=True)
     att_plots_dir.mkdir(parents=True, exist_ok=True)
-    contrastive_plots_dir.mkdir(parents=True, exist_ok=True)
+    test_results_dir.mkdir(parents=True, exist_ok=True)
     
-    return exp_dir, logs_dir, plots_dir, checkpoints_dir, att_plots_dir, contrastive_plots_dir
+    return {
+        'exp_dir': exp_dir,
+        'logs_dir': logs_dir,
+        'plots_dir': plots_dir,
+        'checkpoints_dir': checkpoints_dir,
+        'att_plots_dir': att_plots_dir,
+        'test_results_dir': test_results_dir
+    }
 
-def setup_logger(logs_dir, exp_name):
+def setup_logger(logs_dir, exp_name, log_to_file=True):
     """
-    Setup logging configuration with both file and console handlers.
+    Setup logging configuration with optional file and console handlers.
     """
     # Create logger
     logger = logging.getLogger(exp_name)
@@ -58,12 +66,13 @@ def setup_logger(logs_dir, exp_name):
         datefmt='%H:%M:%S'
     )
     
-    # File handler - logs everything to file
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M')
-    log_file = logs_dir / f"training_{timestamp}.log"
-    file_handler = logging.FileHandler(log_file)
-    file_handler.setLevel(logging.INFO)
-    file_handler.setFormatter(file_formatter)
+    if log_to_file:
+        # File handler - logs everything to file
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M')
+        log_file = logs_dir / f"training_{timestamp}.log"
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(file_formatter)
     
     # Console handler - logs to terminal
     console_handler = logging.StreamHandler()
@@ -71,10 +80,10 @@ def setup_logger(logs_dir, exp_name):
     console_handler.setFormatter(console_formatter)
     
     # Add handlers to logger
-    logger.addHandler(file_handler)
+    if log_to_file:
+        logger.addHandler(file_handler)
+        logger.info(f"Logging to: {log_file}")
     logger.addHandler(console_handler)
-    
-    logger.info(f"Logging to: {log_file}")
     
     return logger
 
@@ -128,8 +137,60 @@ def plot_training_curves(train_losses, train_accs, train_f1s,
     
     return plot_file
 
+
+def plot_regression_curves(train_losses, train_rmses, train_pearson_rs,
+                           val_losses, val_rmses, val_pearson_rs,
+                           plots_dir, timestamp):
+    """
+    Plot and save regression training curves (loss, RMSE, and Pearson correlation).
+    """
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 5))
+    
+    # Plot loss
+    epochs_range = range(1, len(train_losses) + 1)
+    ax1.plot(epochs_range, train_losses, 'b-o', label='Training Loss', linewidth=2, markersize=4)
+    if val_losses:
+        ax1.plot(epochs_range, val_losses, 'r-s', label='Validation Loss', linewidth=2, markersize=4)
+    ax1.set_xlabel('Epoch', fontsize=12)
+    ax1.set_ylabel('MSE Loss', fontsize=12)
+    ax1.set_title('Training and Validation Loss', fontsize=14, fontweight='bold')
+    ax1.legend(fontsize=10)
+    ax1.grid(True, alpha=0.3)
+    
+    # Plot RMSE
+    if train_rmses:
+        ax2.plot(epochs_range, train_rmses, 'b-o', label='Training RMSE', linewidth=2, markersize=4)
+    if val_rmses:
+        ax2.plot(epochs_range, val_rmses, 'r-s', label='Validation RMSE', linewidth=2, markersize=4)
+    ax2.set_xlabel('Epoch', fontsize=12)
+    ax2.set_ylabel('RMSE', fontsize=12)
+    ax2.set_title('Training and Validation RMSE', fontsize=14, fontweight='bold')
+    ax2.legend(fontsize=10)
+    ax2.grid(True, alpha=0.3)
+    
+    # Plot Pearson correlation
+    if train_pearson_rs:
+        ax3.plot(epochs_range, train_pearson_rs, 'b-o', label='Training Pearson r', linewidth=2, markersize=4)
+    if val_pearson_rs:
+        ax3.plot(epochs_range, val_pearson_rs, 'r-s', label='Validation Pearson r', linewidth=2, markersize=4)
+    ax3.set_xlabel('Epoch', fontsize=12)
+    ax3.set_ylabel('Pearson r', fontsize=12)
+    ax3.set_title('Training and Validation Pearson Correlation', fontsize=14, fontweight='bold')
+    ax3.legend(fontsize=10)
+    ax3.grid(True, alpha=0.3)
+    ax3.set_ylim(-1.1, 1.1)
+    
+    plt.tight_layout()
+    
+    # Save plot
+    plot_file = plots_dir / f'regression_curves_{timestamp}.png'
+    plt.savefig(plot_file, bbox_inches='tight')
+    plt.close()
+    
+    return plot_file
+
 def save_checkpoint(model, optimizer, epoch, train_loss, train_acc, val_loss, val_acc, 
-                   checkpoints_dir, logger, is_best=False):
+                   checkpoints_dir, logger, is_best=False, utterance_str2int=None):
     """
     Save model checkpoint.
     """
@@ -142,6 +203,8 @@ def save_checkpoint(model, optimizer, epoch, train_loss, train_acc, val_loss, va
         'val_loss': val_loss,
         'val_acc': val_acc,
     }
+    if utterance_str2int is not None:
+        checkpoint['utterance_str2int'] = utterance_str2int
     
     if is_best:
         # Delete previous best model
@@ -162,6 +225,7 @@ def save_checkpoint(model, optimizer, epoch, train_loss, train_acc, val_loss, va
 def create_weighted_sampler(train_dataset, train_label_counts):
     """
     Create a WeightedRandomSampler based on class frequencies in the training dataset.
+    Only applicable for classification tasks.
 
     Args:
         train_dataset: The training dataset object.
@@ -171,6 +235,13 @@ def create_weighted_sampler(train_dataset, train_label_counts):
         sampler: A WeightedRandomSampler object.
     """
     cls2int = train_dataset.labels_str2int
+    
+    # Check if this is a regression task (labels map to floats)
+    first_mapped_value = next(iter(cls2int.values()))
+    if isinstance(first_mapped_value, float):
+        raise ValueError("Weighted sampler is not supported for regression tasks. "
+                        "Set 'use_weighted_sampler': false in your config.")
+    
     counts_int = {cls2int[k]: v for k, v in train_label_counts.items()}
     num_classes = len(cls2int)
     class_weights = torch.zeros(num_classes, dtype=torch.float)
@@ -230,6 +301,7 @@ def plot_attention_weights(attn_weights, labels, predictions, att_plots_dir, epo
     attn_weights = attn_weights.detach().cpu().numpy()
     labels = labels.detach().cpu().numpy()
     predictions = predictions.detach().cpu().numpy()
+    
     
     # Limit number of samples to plot
     num_samples = min(num_samples, attn_weights.shape[0])
@@ -395,186 +467,6 @@ def plot_attention_summary(attn_weights, labels, att_plots_dir, epoch, timestamp
     return plot_file
 
 
-def plot_contrastive_embeddings(model, dataloader, device, contrastive_plots_dir, epoch, 
-                                 labels_int2str=None, timestamp=None, max_samples=1000):
-    """
-    Visualize contrastive embeddings in 2D space using t-SNE.
-    
-    Args:
-        model: The model (must support return_embeddings=True)
-        dataloader: DataLoader to get samples from
-        device: Device to run inference on
-        contrastive_plots_dir: Directory to save plots
-        epoch: Current epoch number
-        labels_int2str: Optional mapping from label indices to strings
-        timestamp: Timestamp string for file naming
-        max_samples: Maximum number of samples to plot (for speed)
-    
-    Returns:
-        plot_file: Path to the saved plot
-        metrics: Dictionary with embedding quality metrics
-    """
-    import numpy as np
-    from sklearn.manifold import TSNE
-    from sklearn.metrics import silhouette_score
-    from scipy.spatial.distance import pdist, squareform
-    
-    model.eval()
-    all_embeddings = []
-    all_labels = []
-    
-    with torch.no_grad():
-        for batch in dataloader:
-            batch_device = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
-                          for k, v in batch.items()}
-            
-            # Get projected embeddings
-            _, embeddings = model(batch_device, return_embeddings=True)
-            all_embeddings.append(embeddings.cpu())
-            all_labels.append(batch['label'])
-            
-            # Limit samples for speed
-            total_samples = sum(e.shape[0] for e in all_embeddings)
-            if total_samples >= max_samples:
-                break
-    
-    embeddings = torch.cat(all_embeddings, dim=0).numpy()
-    labels = torch.cat(all_labels, dim=0).numpy()
-    
-    # Limit to max_samples
-    if len(embeddings) > max_samples:
-        indices = np.random.choice(len(embeddings), max_samples, replace=False)
-        embeddings = embeddings[indices]
-        labels = labels[indices]
-    
-    # Compute embedding quality metrics
-    metrics = compute_embedding_metrics(embeddings, labels)
-    
-    # t-SNE projection
-    perplexity = min(30, len(embeddings) - 1)  # Adjust perplexity for small datasets
-    tsne = TSNE(n_components=2, random_state=42, perplexity=perplexity, max_iter=1000)
-    embeddings_2d = tsne.fit_transform(embeddings)
-    
-    # Get unique labels and colors
-    unique_labels = np.unique(labels)
-    colors = plt.cm.Set1(np.linspace(0, 1, len(unique_labels)))
-    
-    # Create figure with two subplots
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-    
-    # Plot 1: t-SNE visualization
-    ax1 = axes[0]
-    for i, label in enumerate(unique_labels):
-        mask = labels == label
-        label_name = labels_int2str.get(label, f'Class {label}') if labels_int2str else f'Class {label}'
-        ax1.scatter(embeddings_2d[mask, 0], embeddings_2d[mask, 1], 
-                   c=[colors[i]], label=f'{label_name} (n={mask.sum()})',
-                   alpha=0.6, s=30, edgecolors='white', linewidth=0.5)
-    
-    ax1.set_xlabel('t-SNE Dimension 1', fontsize=11)
-    ax1.set_ylabel('t-SNE Dimension 2', fontsize=11)
-    ax1.set_title(f'Contrastive Embeddings (t-SNE) - Epoch {epoch}', fontsize=12, fontweight='bold')
-    ax1.legend(loc='best', fontsize=9)
-    ax1.grid(True, alpha=0.3)
-    
-    # Plot 2: Metrics summary
-    ax2 = axes[1]
-    ax2.axis('off')
-    
-    metrics_text = f"""
-    Embedding Quality Metrics (Epoch {epoch})
-    {'='*40}
-    
-    Silhouette Score: {metrics['silhouette_score']:.4f}
-    (Range: -1 to 1, higher is better)
-    
-    Intra-class Distance: {metrics['intra_class_distance']:.4f}
-    (Average distance within same class, lower is better)
-    
-    Inter-class Distance: {metrics['inter_class_distance']:.4f}
-    (Average distance between classes, higher is better)
-    
-    Separation Ratio: {metrics['separation_ratio']:.4f}
-    (Inter/Intra ratio, higher is better)
-    
-    {'='*40}
-    Total samples: {len(embeddings)}
-    """
-    
-    ax2.text(0.1, 0.5, metrics_text, transform=ax2.transAxes, fontsize=11,
-             verticalalignment='center', fontfamily='monospace',
-             bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.3))
-    
-    plt.tight_layout()
-    
-    # Save plot
-    ts = timestamp if timestamp else datetime.now().strftime('%Y%m%d_%H%M')
-    plot_file = contrastive_plots_dir / f'embeddings_epoch{epoch}_{ts}.png'
-    plt.savefig(plot_file, bbox_inches='tight', dpi=150)
-    plt.close()
-    
-    return plot_file, metrics
-
-
-def compute_embedding_metrics(embeddings, labels):
-    """
-    Compute metrics to quantify embedding quality.
-    
-    Args:
-        embeddings: Numpy array of shape (N, D)
-        labels: Numpy array of shape (N,)
-    
-    Returns:
-        Dictionary with embedding quality metrics
-    """
-    import numpy as np
-    from sklearn.metrics import silhouette_score
-    from scipy.spatial.distance import pdist, squareform, cosine
-    
-    # Need at least 2 samples per class for meaningful metrics
-    unique_labels, counts = np.unique(labels, return_counts=True)
-    if len(unique_labels) < 2 or min(counts) < 2:
-        return {
-            'silhouette_score': 0.0,
-            'intra_class_distance': 0.0,
-            'inter_class_distance': 0.0,
-            'separation_ratio': 0.0
-        }
-    
-    # Silhouette score: -1 (bad) to 1 (good)
-    try:
-        silhouette = silhouette_score(embeddings, labels, metric='cosine')
-    except:
-        silhouette = 0.0
-    
-    # Compute pairwise cosine distances
-    # Cosine distance = 1 - cosine_similarity
-    distances = squareform(pdist(embeddings, metric='cosine'))
-    
-    # Intra-class distances (same class)
-    intra_distances = []
-    # Inter-class distances (different class)
-    inter_distances = []
-    
-    for i in range(len(labels)):
-        for j in range(i + 1, len(labels)):
-            if labels[i] == labels[j]:
-                intra_distances.append(distances[i, j])
-            else:
-                inter_distances.append(distances[i, j])
-    
-    intra_mean = np.mean(intra_distances) if intra_distances else 0.0
-    inter_mean = np.mean(inter_distances) if inter_distances else 0.0
-    separation_ratio = inter_mean / (intra_mean + 1e-8)
-    
-    return {
-        'silhouette_score': float(silhouette),
-        'intra_class_distance': float(intra_mean),
-        'inter_class_distance': float(inter_mean),
-        'separation_ratio': float(separation_ratio)
-    }
-
-
 def compute_dataset_statistics(dataset, item_key, max_samples=None):
     """
     Compute descriptive statistics for a given item across the entire dataset.
@@ -608,9 +500,14 @@ def compute_dataset_statistics(dataset, item_key, max_samples=None):
         # Convert to numpy if tensor
         if isinstance(item, torch.Tensor):
             item = item.numpy()
+
+        if item_key == 'f0':
+            log_f0 = item
+            voiced_mask = sample['voiced_mask'].numpy().astype(bool)
+            values = log_f0[voiced_mask]
+        else:        
+            values = item.flatten()
         
-        # Flatten and collect all values
-        values = item.flatten()
         all_values.extend(values.tolist())
     
     all_values = np.array(all_values)

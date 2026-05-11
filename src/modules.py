@@ -70,7 +70,17 @@ class Conv1dBlock(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding='same',
                  activation='relu', dropout=0.0, norm=None):
         super(Conv1dBlock, self).__init__()
-        self.conv = nn.Conv1d(in_channels, out_channels, kernel_size, stride=stride, padding=padding)
+        
+        # Handle padding for strided convolutions
+        if stride > 1:
+            # For strided conv, 'same' padding isn't straightforward
+            # Use manual padding to maintain expected downsampling
+            padding_val = kernel_size // 2
+            self.conv = nn.Conv1d(in_channels, out_channels, kernel_size, 
+                                  stride=stride, padding=padding_val)
+        else:
+            self.conv = nn.Conv1d(in_channels, out_channels, kernel_size, 
+                                  stride=stride, padding=padding)
         
         self.norm = None
         if norm == 'batch':
@@ -117,23 +127,23 @@ class Conv1dStack(nn.Module):
     A stack of 1D convolutional blocks.
     """
     def __init__(self, in_channels, hidden_channels, out_channels, kernel_size, 
-                 num_layers=2, activation='relu', dropout=0.0, norm='batch'):
+                 num_layers=2, activation='relu', dropout=0.0, norm='batch', stride=1):
         super(Conv1dStack, self).__init__()
         layers = []
         
-        # First layer
+        # First layer (with stride for downsampling if specified)
         layers.append(Conv1dBlock(in_channels, hidden_channels, kernel_size, 
-                                   activation=activation, dropout=dropout, norm=norm))
+                                   stride=stride, activation=activation, dropout=dropout, norm=norm))
         
-        # Hidden layers
+        # Hidden layers (can also use stride for progressive downsampling)
         for _ in range(num_layers - 2):
             layers.append(Conv1dBlock(hidden_channels, hidden_channels, kernel_size,
-                                       activation=activation, dropout=dropout, norm=norm))
+                                       stride=stride, activation=activation, dropout=dropout, norm=norm))
         
         # Output layer
         if num_layers > 1:
             layers.append(Conv1dBlock(hidden_channels, out_channels, kernel_size,
-                                       activation=activation, dropout=dropout, norm=norm))
+                                       stride=stride, activation=activation, dropout=dropout, norm=norm))
         
         self.stack = nn.Sequential(*layers)
     
@@ -182,14 +192,21 @@ class AttentionPooling(nn.Module):
     Attention pooling over sequence length (bins).
     Input:  x of shape (B, T, C)
     Output: pooled of shape (B, C) and attn weights of shape (B, T)
+    
+    Args:
+        embed_dim: Input embedding dimension
+        hidden_dim: Hidden dimension for attention scorer (None for simple linear)
+        dropout: Dropout rate
+        mode: Attention normalization mode ('sigmoid' or 'softmax')
     """
-    def __init__(self, embed_dim, hidden_dim=None, dropout=0.0):
+    def __init__(self, embed_dim, hidden_dim=None, dropout=0.0, mode='sigmoid'):
         super().__init__()
+        assert mode in ['sigmoid', 'softmax'], "mode must be 'sigmoid' or 'softmax'"
+        self.mode = mode
+        
         if hidden_dim is None:
-            # simple and often sufficient
             self.score = nn.Linear(embed_dim, 1)
         else:
-            # slightly richer scorer can help if attention looks too uniform
             self.score = nn.Sequential(
                 nn.Linear(embed_dim, hidden_dim),
                 nn.GELU(),
@@ -207,8 +224,12 @@ class AttentionPooling(nn.Module):
             # mask: (B, T) with 1 for valid, 0 for invalid
             logits = logits.masked_fill(mask == 0, float("-inf"))
 
-        g = torch.sigmoid(logits / tau)
-        attn = g / (g.sum(dim=1, keepdim=True) + 1e-8)
+        if self.mode == 'softmax':
+            attn = F.softmax(logits / tau, dim=-1)  # (B, T)
+        else:  # sigmoid
+            g = torch.sigmoid(logits / tau)
+            attn = g / (g.sum(dim=1, keepdim=True) + 1e-8)
+        
         if self.dropout is not None:
             attn = self.dropout(attn)
 
@@ -217,104 +238,99 @@ class AttentionPooling(nn.Module):
 
         return pooled, attn
 
-
-# ==============================================================================
-# Contrastive Learning Modules
-# ==============================================================================
-
-class SupervisedContrastiveLoss(nn.Module):
+class LSTMEncoder(nn.Module):
     """
-    Supervised Contrastive Loss (SupCon) from https://arxiv.org/abs/2004.11362
-    
-    Uses labels to define positive pairs (same class) and negative pairs (different class).
+    LSTM encoder for sequential processing.
     
     Args:
-        temperature: Temperature scaling parameter (default: 0.07)
-        base_temperature: Base temperature for normalization (default: 0.07)
+        input_size: Input feature dimension
+        hidden_size: LSTM hidden state dimension
+        num_layers: Number of LSTM layers
+        dropout: Dropout rate (applied between LSTM layers if num_layers > 1)
+        bidirectional: Whether to use bidirectional LSTM
+        output_mode: How to produce output:
+            - 'last': Return last hidden state (B, H*D)
+            - 'all': Return all timesteps (B, T, H*D)
+            - 'pool': Return mean-pooled hidden states (B, H*D)
     """
-    def __init__(self, temperature=0.07, base_temperature=0.07):
-        super(SupervisedContrastiveLoss, self).__init__()
-        self.temperature = temperature
-        self.base_temperature = base_temperature
+    def __init__(self, input_size, hidden_size, num_layers=1, dropout=0.0, 
+                 bidirectional=True, output_mode='all'):
+        super().__init__()
+        
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.bidirectional = bidirectional
+        self.num_directions = 2 if bidirectional else 1
+        self.output_size = hidden_size * self.num_directions
+        self.output_mode = output_mode
+        
+        self.lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0,
+            bidirectional=bidirectional
+        )
+        
+        self.layer_norm = nn.LayerNorm(self.output_size)
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else None
     
-    def forward(self, features, labels):
+    def forward(self, x, lengths=None):
         """
         Args:
-            features: Hidden vectors of shape (B, D) - should be L2 normalized
-            labels: Ground truth labels of shape (B,)
+            x: Input tensor of shape (B, T, C)
+            lengths: Optional sequence lengths for packed sequence (B,)
         
         Returns:
-            loss: Supervised contrastive loss
+            output: Depending on output_mode:
+                - 'last': (B, H*D)
+                - 'all': (B, T, H*D)
+                - 'pool': (B, H*D)
         """
-        device = features.device
-        batch_size = features.shape[0]
+        if lengths is not None:
+            # Pack sequence for variable length inputs
+            x_packed = nn.utils.rnn.pack_padded_sequence(
+                x, lengths.cpu(), batch_first=True, enforce_sorted=False
+            )
+            lstm_out, (h_n, c_n) = self.lstm(x_packed)
+            lstm_out, _ = nn.utils.rnn.pad_packed_sequence(lstm_out, batch_first=True)
+        else:
+            lstm_out, (h_n, c_n) = self.lstm(x)
         
-        # Need at least 2 samples to compute contrastive loss
-        if batch_size < 2:
-            return torch.tensor(0.0, device=device, requires_grad=True)
+        # lstm_out: (B, T, H*D)
+        # h_n: (num_layers * num_directions, B, H)
         
-        # L2 normalize features
-        features = F.normalize(features, p=2, dim=1)
+        if self.output_mode == 'last':
+            # Concatenate last hidden states from both directions
+            if self.bidirectional:
+                # h_n[-2] is forward, h_n[-1] is backward
+                output = torch.cat([h_n[-2], h_n[-1]], dim=-1)  # (B, H*2)
+            else:
+                output = h_n[-1]  # (B, H)
+        elif self.output_mode == 'pool':
+            # Mean pool over time dimension
+            if lengths is not None:
+                # Masked mean pooling
+                mask = torch.arange(lstm_out.size(1), device=lstm_out.device).unsqueeze(0) < lengths.unsqueeze(1)
+                mask = mask.unsqueeze(-1).float()
+                output = (lstm_out * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+            else:
+                output = lstm_out.mean(dim=1)  # (B, H*D)
+        else:  # 'all'
+            output = lstm_out  # (B, T, H*D)
         
-        # Compute similarity matrix
-        similarity_matrix = torch.matmul(features, features.T)  # (B, B)
+        output = self.layer_norm(output)
         
-        # Clamp similarity to prevent numerical issues
-        similarity_matrix = torch.clamp(similarity_matrix, min=-1.0, max=1.0)
+        if self.dropout is not None:
+            output = self.dropout(output)
         
-        # Create mask for positive pairs (same label, excluding self)
-        labels = labels.contiguous().view(-1, 1)
-        mask_positives = torch.eq(labels, labels.T).float().to(device)  # (B, B)
-        
-        # Remove self-contrast (diagonal)
-        self_mask = torch.eye(batch_size, dtype=torch.bool, device=device)
-        mask_positives = mask_positives.masked_fill(self_mask, 0)
-        
-        # Count positives per anchor
-        num_positives = mask_positives.sum(dim=1)  # (B,)
-        
-        # Check if there are any valid positive pairs
-        if num_positives.sum() == 0:
-            # No positive pairs in batch - return zero loss
-            return torch.tensor(0.0, device=device, requires_grad=True)
-        
-        # Apply temperature scaling
-        logits = similarity_matrix / self.temperature
-        
-        # For numerical stability, subtract max
-        logits_max, _ = torch.max(logits, dim=1, keepdim=True)
-        logits = logits - logits_max.detach()
-        
-        # Mask out self-contrast for denominator
-        exp_logits = torch.exp(logits)
-        exp_logits = exp_logits.masked_fill(self_mask, 0)
-        
-        # Compute log-softmax denominator (sum over all except self)
-        log_sum_exp = torch.log(exp_logits.sum(dim=1, keepdim=True) + 1e-8)
-        
-        # Compute log-prob for all pairs
-        log_prob = logits - log_sum_exp
-        
-        # Mask out self for log_prob as well
-        log_prob = log_prob.masked_fill(self_mask, 0)
-        
-        # Compute mean log-likelihood over positive pairs
-        # Only consider anchors that have at least one positive
-        mask_valid = num_positives > 0
-        
-        # Mean log-prob of positive pairs for each anchor
-        mean_log_prob_pos = (mask_positives * log_prob).sum(dim=1) / (num_positives + 1e-8)
-        
-        # Loss (only for valid anchors)
-        loss = -(self.base_temperature / self.temperature) * mean_log_prob_pos
-        loss = loss[mask_valid].mean()
-        
-        # Final safety check
-        if torch.isnan(loss) or torch.isinf(loss):
-            return torch.tensor(0.0, device=device, requires_grad=True)
-        
-        return loss
+        return output
 
+
+# ==============================================================================
+# Projection Head (for embedding tasks)
+# ==============================================================================
 
 class ProjectionHead(nn.Module):
     """

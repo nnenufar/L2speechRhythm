@@ -30,6 +30,10 @@ This repository contains code associated with the Master's project titled "Enhan
 
     If you're using the already implemented datasets, simply use the dataset name in the training config file.
 
+    The adopted approach is to specify samples IDs with data_sources.py then feed them to the DatasetLMDB class and create a dataloader from it.
+
+    data_sources looks at the CSV file created with create_arctic_data.py
+
 4. Config file
     Specify all desired training and model parameters in a ``.json`` file inside ``/config``
 

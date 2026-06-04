@@ -1,0 +1,35 @@
+{
+  "exp_name": "duration_regressor_speechocean",
+  "model_type": "duration_regressor",
+  "batch_size": 64,
+  "collate_fn": "pad",
+  "model_params": {
+    "phone_embed_dim": 64,
+    "lstm_hidden_size": 64,
+    "lstm_num_layers": 1,
+    "lstm_bidirectional": true,
+    "dropout": 0.1,
+    "hidden_size": 32,
+    "task": "regression",
+    "target_mean": 0.0,
+    "target_std": 10.0
+  },
+  "dataset_params": {
+    "lmdb_path": "data/speechocean/rtm_feats.lmdb",
+    "data_source": "speechocean",
+    "items": ["v_phones", "v_plen", "v_dur", "c_phones", "c_plen", "c_dur"],
+    "test_size": 0.20,
+    "vc_features_path": "data/speechocean/vc_features.json"
+  },
+  "training_params": {
+    "learning_rate": 1e-3,
+    "num_epochs": 500,
+    "weight_decay": 1e-4,
+    "plot_every": 20,
+    "save_every": 20,
+    "use_early_stopping": true,
+    "early_stop_patience": 50,
+    "use_scheduler": false,
+    "use_weighted_sampler": false
+  }
+}

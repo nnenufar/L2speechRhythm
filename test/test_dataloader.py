@@ -4,7 +4,7 @@ from src import train_utils
 from collections import Counter
 import torch
 
-items = ['waveform']
+items = ['envelope']
 splits = ['Train', 'Development', 'Test']
 
 print("="*70)
@@ -16,7 +16,7 @@ for split in splits:
     print(f"Split: {split}")
     print("="*70)
     
-    dataset = DatasetLMDB('data/arctic/rtm_feats_bark_f0_egemaps.lmdb', data_source='arctic_regression', split=split, items=items)
+    dataset = DatasetLMDB('data/speechocean/rtm_feats.lmdb', data_source='speechocean', split=split, items=items)
     
     print(f"Number of samples: {len(dataset)}")
     print(f"Unique speakers: {len(dataset.speaker_str2int)}")
@@ -26,9 +26,6 @@ for split in splits:
     # Class distribution
     str_counts = Counter(dataset.labels.values())
     print(f"Class distribution: {dict(str_counts)}")
-    
-    # Speaker mapping
-    print(f"Speakers: {list(dataset.speaker_str2int.keys())}")
 
 print("\n" + "="*70)
 print("Batch Test (Train split)")
@@ -37,7 +34,7 @@ print("="*70)
 collateFunc = processor_ssl if 'waveform' in items else collate_fn
 
 # Test batch loading with Train split
-dataset = DatasetLMDB('data/arctic/rtm_feats_bark_f0_egemaps.lmdb', data_source='arctic_regression', split='Train', items=items)
+dataset = DatasetLMDB('data/speechocean/rtm_feats.lmdb', data_source='speechocean', split='Train', items=items)
 #sampler = train_utils.create_weighted_sampler(dataset, str_counts)
 str_counts = Counter(dataset.labels.values())
 

@@ -199,10 +199,11 @@ class AttentionPooling(nn.Module):
         dropout: Dropout rate
         mode: Attention normalization mode ('sigmoid' or 'softmax')
     """
-    def __init__(self, embed_dim, hidden_dim=None, dropout=0.0, mode='sigmoid'):
+    def __init__(self, embed_dim, hidden_dim=None, dropout=0.0, mode='sigmoid', use_norm=True):
         super().__init__()
         assert mode in ['sigmoid', 'softmax'], "mode must be 'sigmoid' or 'softmax'"
         self.mode = mode
+        self.use_norm = use_norm
         
         if hidden_dim is None:
             self.score = nn.Linear(embed_dim, 1)
@@ -213,7 +214,7 @@ class AttentionPooling(nn.Module):
                 nn.Dropout(dropout),
                 nn.Linear(hidden_dim, 1),
             )
-        self.norm = nn.LayerNorm(embed_dim)
+        self.norm = nn.LayerNorm(embed_dim) if use_norm else nn.Identity()
         self.dropout = nn.Dropout(dropout) if dropout > 0 else None
 
     def forward(self, x, mask=None, tau=2.0):
@@ -366,3 +367,172 @@ class ProjectionHead(nn.Module):
     
     def forward(self, x):
         return self.proj(x)
+
+
+# ==============================================================================
+# Contrastive Loss
+# ==============================================================================
+
+def per_utterance_contrastive_loss(embeddings, utterance_ids, is_l1, temperature=0.07):
+    """
+    Per-utterance supervised contrastive loss.
+    Anchors are L1 samples only. Positives are other L1 samples of the same utterance.
+    Negatives are L2 samples of the same utterance only (no cross-utterance negatives).
+
+    Args:
+        embeddings: (B, D) L2-normalized encoder outputs
+        utterance_ids: (B,) integer tensor, same value for samples of same utterance
+        is_l1: (B,) boolean tensor, True for L1 (anchor) samples
+        temperature: scalar temperature
+
+    Returns:
+        scalar loss
+    """
+    device = embeddings.device
+    sim = torch.matmul(embeddings, embeddings.T) / temperature
+
+    unique_utterances = torch.unique(utterance_ids)
+
+    total_loss = torch.tensor(0.0, device=device)
+    num_anchors = 0
+
+    for utt in unique_utterances:
+        utt_mask = utterance_ids == utt
+        l1_mask = utt_mask & is_l1
+        l2_mask = utt_mask & ~is_l1
+
+        l1_indices = torch.where(l1_mask)[0]
+        l2_indices = torch.where(l2_mask)[0]
+
+        if len(l1_indices) < 2 or len(l2_indices) == 0:
+            continue
+
+        for anchor_idx in l1_indices:
+            pos_mask = l1_mask.clone()
+            pos_mask[anchor_idx] = False
+
+            pos_sim = sim[anchor_idx][pos_mask]
+            neg_sim = sim[anchor_idx][l2_mask]
+
+            pos_exp = torch.exp(pos_sim)
+            neg_exp = torch.exp(neg_sim)
+
+            numerator = pos_exp.sum()
+            denominator = numerator + neg_exp.sum()
+
+            loss_i = -torch.log(numerator / (denominator + 1e-8))
+            total_loss = total_loss + loss_i
+            num_anchors += 1
+
+    if num_anchors == 0:
+        return torch.tensor(0.0, device=device, requires_grad=True)
+
+    return total_loss / num_anchors
+
+
+# ==============================================================================
+# Text Encoder
+# ==============================================================================
+
+class TextEncoder(nn.Module):
+    """
+    Phoneme sequence encoder: embedding → conv stack → bidirectional LSTM.
+    Standard architecture for TTS text encoding.
+    """
+    def __init__(self, vocab_size, embed_dim, conv_channels, kernel_size,
+                 lstm_hidden, lstm_layers, dropout):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+        self.convs = Conv1dStack(
+            in_channels=embed_dim,
+            hidden_channels=conv_channels,
+            out_channels=conv_channels,
+            kernel_size=kernel_size,
+            num_layers=3,
+            activation='relu',
+            dropout=dropout,
+            norm='layer'
+        )
+        self.lstm = LSTMEncoder(
+            input_size=conv_channels,
+            hidden_size=lstm_hidden,
+            num_layers=lstm_layers,
+            dropout=dropout,
+            bidirectional=True,
+            output_mode='all'
+        )
+        self.output_dim = self.lstm.output_size
+
+    def forward(self, phoneme_ids, lengths):
+        x = self.embedding(phoneme_ids)
+        x = x.permute(0, 2, 1)
+        x = self.convs(x)
+        x = x.permute(0, 2, 1)
+        x = self.lstm(x, lengths)
+        return x
+
+
+# ==============================================================================
+# Cross-Attention
+# ==============================================================================
+
+class AdditiveCrossAttention(nn.Module):
+    """
+    Bahdanau-style additive cross-attention.
+    Queries attend to keys, producing a context vector at each query position.
+    """
+    def __init__(self, query_dim, key_dim, attn_dim, dropout=0.0):
+        super().__init__()
+        self.W_q = nn.Linear(query_dim, attn_dim, bias=False)
+        self.W_k = nn.Linear(key_dim, attn_dim, bias=False)
+        self.v = nn.Linear(attn_dim, 1, bias=False)
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else None
+
+    def forward(self, queries, keys, key_lengths=None):
+        q_proj = self.W_q(queries)
+        k_proj = self.W_k(keys)
+
+        q_proj = q_proj.unsqueeze(2)
+        k_proj = k_proj.unsqueeze(1)
+        energy = torch.tanh(q_proj + k_proj)
+        energy = self.v(energy).squeeze(-1)
+
+        if key_lengths is not None:
+            mask = torch.arange(keys.size(1), device=keys.device).unsqueeze(0) < key_lengths.unsqueeze(1)
+            energy = energy.masked_fill(~mask.unsqueeze(1), float('-inf'))
+
+        attn = F.softmax(energy, dim=-1)
+
+        if self.dropout is not None:
+            attn = self.dropout(attn)
+
+        context = torch.bmm(attn, keys)
+        return context, attn
+
+
+# ==============================================================================
+# Monotonicity Regularization
+# ==============================================================================
+
+def monotonicity_loss(attn_weights, margin=1.0):
+    """
+    Penalize backward movement in cross-attention alignment.
+    Computes expected alignment position per audio timestep and penalizes
+    decreases relative to the previous timestep.
+
+    Args:
+        attn_weights: (B, T_audio, T_text) attention matrix
+        margin: Allowed backward drift in positions before penalty applies
+
+    Returns:
+        scalar loss
+    """
+    T_text = attn_weights.size(-1)
+    positions = torch.arange(T_text, device=attn_weights.device, dtype=attn_weights.dtype)
+    expected_pos = (attn_weights * positions).sum(dim=-1)
+
+    prev_pos = expected_pos[:, :-1]
+    curr_pos = expected_pos[:, 1:]
+    penalty = F.relu(prev_pos - curr_pos + margin)
+
+    return penalty.mean()

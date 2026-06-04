@@ -1,0 +1,40 @@
+{
+  "exp_name": "rhythm_regression_ft",
+  "model_type": "rhythm_regressor",
+  "batch_size": 64,
+  "collate_fn": "pad",
+  "model_params": {
+    "pretrained_checkpoint": "exp/rhythm_encoder_contrastive/checkpoints/20260514_1046/best_model.pth",
+    "freeze_encoder": false,
+    "hidden_size": 32,
+    "dropout": 0.1,
+    "feat_dim": 1,
+    "kernel_size": 3,
+    "cnn_out_channels": 64,
+    "num_cnn_layers": 2,
+    "lstm_hidden_size": 64,
+    "lstm_num_layers": 1,
+    "lstm_bidirectional": true,
+    "use_text": false,
+    "task": "regression",
+    "target_mean": 0.0,
+    "target_std": 10.0
+  },
+  "dataset_params": {
+    "lmdb_path": "data/speechocean/rtm_feats.lmdb",
+    "data_source": "speechocean",
+    "items": ["envelope"],
+    "test_size": 0.20
+  },
+  "training_params": {
+    "learning_rate": 1e-3,
+    "num_epochs": 500,
+    "weight_decay": 1e-4,
+    "plot_every": 20,
+    "save_every": 20,
+    "use_early_stopping": true,
+    "early_stop_patience": 50,
+    "use_scheduler": false,
+    "use_weighted_sampler": false
+  }
+}

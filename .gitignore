@@ -207,8 +207,6 @@ marimo/_lsp/
 __marimo__/
 
 data
-slurm
 exp
-inference
-stats
-config
+slurm/out
+analysis/rhythm_encoder

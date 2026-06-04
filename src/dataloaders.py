@@ -1,10 +1,13 @@
 import torch
 from transformers import AutoFeatureExtractor
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 from pathlib import Path
 import numpy as np
+import pandas as pd
 import pickle
 import lmdb
+import random
+from collections import defaultdict
 from src.data_sources import get_labels_for_source, DATA_SOURCE_HANDLERS
 
 data_sources = list(DATA_SOURCE_HANDLERS.keys())
@@ -39,11 +42,9 @@ def process_labels(labels: list):
 def parse_identifier(identifier: str):
     """
     Parse an identifier string into speaker_id and utterance_id.
-    Expected format: <speaker_id>_<dataset_name>_<utterance_id>
-    Example: YBAA_arctic_a0503.wav -> ('YBAA', 'a0503.wav')
-    
-    Args:
-        identifier: String identifier in the format <speaker_id>_<dataset_name>_<utterance_id>
+    Supports two formats:
+      <speaker_id>_<dataset_name>_<utterance_id>   (e.g. ljm_arctic_a0572.wav)
+      <speaker_id>_<utterance_id>                  (e.g. SPEAKER0001_000010011.WAV)
     
     Returns:
         speaker_id: The speaker identifier.
@@ -51,7 +52,10 @@ def parse_identifier(identifier: str):
     """
     parts = identifier.split('_')
     speaker_id = parts[0]
-    utterance_id = Path('_'.join(parts[2:])).stem   # In case utterance_id contains underscores
+    if len(parts) >= 3:
+        utterance_id = Path('_'.join(parts[2:])).stem
+    else:
+        utterance_id = Path('_'.join(parts[1:])).stem
     return speaker_id, utterance_id
 
 def process_identifiers(identifiers: list):
@@ -85,18 +89,33 @@ def process_identifiers(identifiers: list):
     
     return speaker_str2int, speaker_int2str, utterance_str2int, utterance_int2str
 
+def _pad_2d(items, pad_value=0):
+    """Pad list of (N_i, L_i) tensors to (B, N_max, L_max)."""
+    N_max = max(t.shape[0] for t in items)
+    L_max = max((t.shape[1] for t in items if t.numel() > 0), default=1)
+    out = torch.full((len(items), N_max, L_max), pad_value, dtype=items[0].dtype)
+    for i, t in enumerate(items):
+        if t.numel() == 0:
+            continue
+        N, L = t.shape
+        out[i, :N, :L] = t
+    return out
+
+
 def collate_fn(batch):
     """
     Simple collate function for dictionary batches.
-    Pads sequences and stacks tensors.
+    Pads sequences and stacks tensors. Handles 1D and 2D tensors.
     """
     collated = {}
     for key in batch[0].keys():
         items = [sample[key] for sample in batch]
-        # Skip string items - don't collate them, just keep as list
         if isinstance(items[0], str):
             collated[key] = items
-        elif items[0].dim() > 0:
+        elif items[0].dim() == 2:
+            collated[key] = _pad_2d([it.long() if it.dtype != torch.float32 else it for it in items],
+                                     pad_value=0)
+        elif items[0].dim() == 1:
             collated[key] = torch.nn.utils.rnn.pad_sequence(items, batch_first=True)
         else:
             collated[key] = torch.stack(items)
@@ -164,9 +183,12 @@ class DatasetLMDB(Dataset):
     """
     def __init__(self, lmdb_path, data_source, split, items, test_size=0.2, random_seed=42,
                  target_mean=None, target_std=None,
-                 external_utterance_str2int=None, external_utterance_int2str=None):
+                 external_utterance_str2int=None, external_utterance_int2str=None,
+                 phoneme_mapping=None, vc_features=None, label_column='fluency'):
         possible_splits = ['Train', 'Development', 'Test']
-        possible_items = ['key', 'beats', 'envelope_spectrum', 'feats', 'intervals', 'envelope', 'spectrum_freq_bins', 'dur', 'waveform', 'f0', 'voiced_mask', 'egemaps', 'f0_wavelet']
+        possible_items = ['key', 'beats', 'envelope_spectrum', 'feats', 'intervals', 'envelope', 'spectrum_freq_bins', 'dur', 'waveform', 'f0', 'voiced_mask', 'egemaps', 'f0_wavelet',
+                          'phoneme_ids', 'phoneme_lengths',
+                          'v_phones', 'v_plen', 'v_dur', 'c_phones', 'c_plen', 'c_dur']
         assert data_source in set(data_sources), "Invalid data source. Check /data directory for available options."
         assert split in possible_splits, f"Invalid split. Must be one of {possible_splits}"
         assert set(items).issubset(possible_items), f"Invalid items. Must be one of {possible_items}"
@@ -176,6 +198,8 @@ class DatasetLMDB(Dataset):
         self.random_seed = random_seed
         self.test_size = test_size
         self.items = items
+        self.phoneme_mapping = phoneme_mapping
+        self.vc_features = vc_features
         
         # Target normalization for regression tasks
         self.target_mean = target_mean
@@ -184,7 +208,8 @@ class DatasetLMDB(Dataset):
         self.env = lmdb.open(lmdb_path, readonly=True, lock=False, readahead=False, meminit=False)
 
         # Get labels for the specified data source
-        self.labels = get_labels_for_source(data_source, split, test_size, random_seed) #Dict{identifier (as in lmdb): label}
+        self.labels = get_labels_for_source(data_source, split, test_size, random_seed,
+                                             label_column=label_column) #Dict{identifier (as in lmdb): label}
         self.lmdb_keys = subset_lmdb(self.env, self.labels.keys())
 
         self.labels_map = process_labels(list(self.labels.values()))
@@ -220,6 +245,9 @@ class DatasetLMDB(Dataset):
         key = entry['key']
 
         for item in self.items:
+            if item in ('phoneme_ids', 'phoneme_lengths',
+                       'v_phones', 'v_plen', 'v_dur', 'c_phones', 'c_plen', 'c_dur'):
+                continue
             if item == "waveform":
                 result[item] = np.array(entry[item], dtype=np.float32)
             else:
@@ -232,7 +260,7 @@ class DatasetLMDB(Dataset):
         # For classification: use integer label
         if self.target_mean is not None and self.target_std is not None:
             # Regression with normalization
-            label = (float(label) - self.target_mean) / (self.target_std + 1e-8)
+            label = (float(label) - self.target_mean) / (self.target_std)
             result['label'] = torch.tensor(label, dtype=torch.float32)
         elif isinstance(label, float):
             # Regression without normalization
@@ -247,7 +275,122 @@ class DatasetLMDB(Dataset):
         result['speaker_id'] = torch.tensor(self.speaker_str2int[speaker_id])
         result['utterance_id'] = torch.tensor(self.utterance_str2int.get(utterance_id, 0))
 
+        if 'phoneme_ids' in self.items and self.phoneme_mapping is not None:
+            phoneme_ids = self.phoneme_mapping[utterance_id]
+            result['phoneme_ids'] = torch.tensor(phoneme_ids, dtype=torch.long)
+            result['phoneme_lengths'] = torch.tensor(len(phoneme_ids), dtype=torch.long)
+
+        vc_items_needed = any(item in self.items for item in (
+            'v_phones', 'v_plen', 'v_dur', 'c_phones', 'c_plen', 'c_dur'))
+        if vc_items_needed:
+            spk_id, utt_id = parse_identifier(key)
+            lookup_key = f'{spk_id}_{utt_id}'
+            if self.vc_features is not None and lookup_key in self.vc_features:
+                vc = self.vc_features[lookup_key]
+                has_phones = 'v_phones' in vc
+                for prefix in ('v', 'c'):
+                    cat = f'{prefix}_phones'
+                    if has_phones:
+                        intervals = vc[cat]
+                        if intervals:
+                            L_max = max(len(seq) for seq in intervals)
+                            padded = torch.zeros(len(intervals), L_max, dtype=torch.long)
+                            plen = torch.zeros(len(intervals), dtype=torch.long)
+                            for i, seq in enumerate(intervals):
+                                padded[i, :len(seq)] = torch.tensor(seq, dtype=torch.long)
+                                plen[i] = len(seq)
+                            result[cat] = padded
+                            result[f'{prefix}_plen'] = plen
+                        else:
+                            result[cat] = torch.zeros(0, 0, dtype=torch.long)
+                            result[f'{prefix}_plen'] = torch.zeros(0, dtype=torch.long)
+                    result[f'{prefix}_dur'] = torch.tensor(vc[f'{prefix}_dur'], dtype=torch.float32)
+            else:
+                for prefix in ('v', 'c'):
+                    result[f'{prefix}_phones'] = torch.zeros(0, 0, dtype=torch.long)
+                    result[f'{prefix}_plen'] = torch.zeros(0, dtype=torch.long)
+                    result[f'{prefix}_dur'] = torch.zeros(0, dtype=torch.float32)
+
         return result
+
+
+class ContrastiveBatchSampler(Sampler):
+    """
+    Batch sampler for contrastive pretraining of the rhythm encoder.
+    Groups samples by utterance ID and ensures each batch has L1 and L2 samples
+    for a configurable number of utterances.
+
+    Args:
+        dataset: DatasetLMDB instance
+        csv_path: Path to arctic_metadata.csv
+        utterances_per_batch: Number of distinct utterances per batch
+        l1_per_utterance: Number of L1 (native) samples per utterance
+        l2_per_utterance: Number of L2 (non-native) samples per utterance
+        shuffle: Whether to shuffle utterances within a batch
+    """
+    def __init__(self, dataset, csv_path, utterances_per_batch, l1_per_utterance,
+                 l2_per_utterance, shuffle=True):
+        self.utterances_per_batch = utterances_per_batch
+        self.l1_per_utterance = l1_per_utterance
+        self.l2_per_utterance = l2_per_utterance
+        self.shuffle = shuffle
+
+        df = pd.read_csv(csv_path)
+
+        key_to_idx = {key.decode('utf-8'): i for i, key in enumerate(dataset.lmdb_keys)}
+
+        self.l1_keys_by_utt = defaultdict(list)
+        self.l2_keys_by_utt = defaultdict(list)
+
+        for _, row in df.iterrows():
+            identifier = row['identifier']
+            utt_id = row['uttID']
+            cond = row['cond']
+
+            if identifier not in key_to_idx:
+                continue
+
+            idx = key_to_idx[identifier]
+            if cond == 'n':
+                self.l1_keys_by_utt[utt_id].append(idx)
+            elif cond == 'nn':
+                self.l2_keys_by_utt[utt_id].append(idx)
+
+        self.valid_utterances = [
+            utt for utt in self.l1_keys_by_utt
+            if len(self.l1_keys_by_utt[utt]) >= l1_per_utterance
+            and len(self.l2_keys_by_utt.get(utt, [])) >= 1
+        ]
+
+        if not self.valid_utterances:
+            raise ValueError(
+                f"No utterances with at least {l1_per_utterance} L1 samples and 1 L2 sample. "
+                f"Check the CSV and dataset."
+            )
+
+        self.num_batches = max(1, len(self.valid_utterances) // utterances_per_batch)
+
+    def __len__(self):
+        return self.num_batches
+
+    def __iter__(self):
+        indices = []
+        utterances_pool = list(self.valid_utterances)
+
+        for _ in range(self.num_batches):
+            batch_utterances = random.sample(utterances_pool, self.utterances_per_batch)
+            batch_indices = []
+            for utt in batch_utterances:
+                l1_sample = random.sample(self.l1_keys_by_utt[utt], self.l1_per_utterance)
+                l2_count = min(self.l2_per_utterance, len(self.l2_keys_by_utt.get(utt, [])))
+                l2_sample = random.sample(self.l2_keys_by_utt[utt], l2_count)
+                batch_indices.extend(l1_sample)
+                batch_indices.extend(l2_sample)
+            if self.shuffle:
+                random.shuffle(batch_indices)
+            indices.append(batch_indices)
+
+        return iter(indices)
 
 
 

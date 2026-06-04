@@ -4,7 +4,7 @@ import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split
 
-def get_arctic_data(split, test_size, random_seed):
+def get_arctic_data(split, test_size, random_seed, **kwargs):
     """Handle Arctic dataset configuration (combines arctic_cmu and arctic_l2)"""
 
     df = pd.read_csv('data/arctic/arctic_metadata.csv') # CSV created using utils/create_arctic_table.py
@@ -49,7 +49,7 @@ def get_arctic_data(split, test_size, random_seed):
     labels_dict = df.set_index('identifier')['l1'].to_dict()
     return {key: labels_dict[key] for key in files_for_split}
 
-def get_arctic_data_regression(split, test_size=0.10, random_seed=42):
+def get_arctic_data_regression(split, test_size=0.10, random_seed=42, **kwargs):
     """
     Handle Arctic dataset configuration (only arctic_l2)
     Splits are separated for a regression with the ibt scores.
@@ -96,54 +96,6 @@ def get_arctic_data_regression(split, test_size=0.10, random_seed=42):
     return {key: labels_dict[key] for key in files_for_split}
 
 
-def get_msp_data(split, test_size, random_seed):
-    """Handle MSP dataset configuration"""
-    labels_to_use = ['A', 'H', 'N', 'S']
-    labels_df = pd.read_csv('data/MSP/labels_consensus.csv')
-    labels_df = labels_df[labels_df['EmoClass'].isin(labels_to_use)]
-    dev_df = labels_df[labels_df['Split_Set'] == 'Development']
-
-    dev_files, test_files = train_test_split(
-        dev_df['FileName'].values,
-        test_size=test_size,
-        random_state=random_seed,
-        stratify=dev_df['EmoClass'].values
-    )
-
-    if split is not None:
-        labels_df = labels_df[labels_df['Split_Set'] == split]
-        if split == 'Development':
-            labels_df = labels_df[labels_df['FileName'].isin(dev_files)]
-        elif split == 'Test':
-            labels_df = dev_df[dev_df['FileName'].isin(test_files)]
-
-    return labels_df.set_index('FileName')['EmoClass'].to_dict()
-
-
-def get_globo_data(split, test_size, random_seed):
-    """Handle Globo dataset configuration"""
-    train_files, testValid_files = train_test_split(
-        os.listdir('data/globo/wavs'),
-        test_size=test_size,
-        random_state=random_seed
-    )
-    valid_files, test_files = train_test_split(
-        testValid_files,
-        test_size=0.5,
-        random_state=random_seed
-    )
-
-    split_map = {
-        "Train": train_files,
-        "Development": valid_files,
-        "Test": test_files
-    }
-    
-    keys = split_map.get(split)
-    return {key: "J" for key in keys}
-
-
-def get_mtedx_data(split, test_size, random_seed):
     """Handle mTEDx dataset configuration"""
     base_path = 'data/mtedx/'
     
@@ -160,19 +112,108 @@ def get_mtedx_data(split, test_size, random_seed):
     keys = split_map.get(split)
     return {key: "P" for key in keys}
 
+def get_arctic_data_contrastive(split, test_size=0.05, random_seed=42, **kwargs):
+    """
+    Arctic samples for contrastive pretraining, split at the utterance level.
+    Labels: "L1" for native (cond='n'), "L2" for non-native (cond='nn').
+    test_size: fraction of UTTERANCES (not samples) held out for validation.
+    """
+    df = pd.read_csv('data/arctic/arctic_metadata.csv')
+
+    all_utt_ids = sorted(df['uttID'].unique())
+    rng = np.random.RandomState(random_seed)
+    rng.shuffle(all_utt_ids)
+
+    n_val = max(1, int(len(all_utt_ids) * test_size))
+    val_utt_ids = set(all_utt_ids[:n_val])
+
+    if split == 'Train':
+        utt_filter = lambda utt: utt not in val_utt_ids
+    elif split == 'Development':
+        utt_filter = lambda utt: utt in val_utt_ids
+    else:
+        return {}
+
+    labels_dict = {}
+    for _, row in df.iterrows():
+        if not utt_filter(row['uttID']):
+            continue
+        if row['cond'] == 'n':
+            labels_dict[row['identifier']] = 'L1'
+        elif row['cond'] == 'nn':
+            labels_dict[row['identifier']] = 'L2'
+    return labels_dict
+
+def get_speechocean_data(split, test_size=0.05, random_seed=42, label_column='fluency'):
+    """
+    Speechocean dataset for fluency/prosodic score regression.
+    Uses the predefined train/test split from the original dataset (split column in CSV).
+    The training portion is subdivided into Train/Development via stratified splitting.
+    Returns {identifier: score (float)}.
+    """
+    df = pd.read_csv('data/speechocean/speechocean_metadata.csv')
+
+    na_indices = df.index[df[label_column].isna()]
+    if len(na_indices) > 0:
+        print(f"Dropping {len(na_indices)} entries with missing {label_column} scores "
+              f"at rows: {na_indices.tolist()}")
+        df = df.drop(index=na_indices)
+
+    df[label_column] = df[label_column].astype(float)
+
+    train_df = df[df['split'] == 'train']
+    test_df = df[df['split'] == 'test']
+
+    if len(train_df) == 0 or len(test_df) == 0:
+        raise ValueError(
+            f"Expected both 'train' and 'test' entries in split column. "
+            f"Got {len(train_df)} train, {len(test_df)} test."
+        )
+
+    test_ids = test_df['identifier'].values
+
+    train_ids = train_df['identifier'].values
+    train_scores = train_df[label_column].values
+
+    score_counts = pd.Series(train_scores).value_counts().to_dict()
+    min_for_stratify = max(int(np.ceil(2.0 / test_size)), 4)
+    rare_scores = {s for s, c in score_counts.items() if c < min_for_stratify}
+    stratify_labels = np.array([-1.0 if s in rare_scores else s for s in train_scores])
+
+    if rare_scores:
+        print(f"Binning {len(rare_scores)} rare score classes for stratification: "
+              f"{sorted(rare_scores)} (total {int((stratify_labels == -1.0).sum())} samples)")
+
+    train_sub_ids, dev_ids, _, _ = train_test_split(
+        train_ids, train_scores,
+        test_size=test_size, random_state=random_seed, stratify=stratify_labels
+    )
+
+    split_map = {
+        "Train": train_sub_ids,
+        "Development": dev_ids,
+        "Test": test_ids
+    }
+
+    print(f"Speechocean splits — Train: {len(train_sub_ids)}, Dev: {len(dev_ids)}, "
+          f"Test: {len(test_ids)}")
+
+    files_for_split = split_map.get(split)
+    labels_dict = df.set_index('identifier')[label_column].to_dict()
+    return {key: labels_dict[key] for key in files_for_split}
+
 
 # Registry of data source handlers
 DATA_SOURCE_HANDLERS = {
-    'MSP': get_msp_data,
-    'globo': get_globo_data,
-    'mtedx': get_mtedx_data,
     'arctic': get_arctic_data,
     'arctic_regression': get_arctic_data_regression,
+    'arctic_contrastive': get_arctic_data_contrastive,
+    'speechocean': get_speechocean_data,
 }
 
-def get_labels_for_source(data_source, split, test_size, random_seed):
+def get_labels_for_source(data_source, split, test_size, random_seed, **kwargs):
     """Get labels for a specific data source"""
     if data_source not in DATA_SOURCE_HANDLERS:
         raise ValueError(f"Unknown data source: {data_source}")
-    
-    return DATA_SOURCE_HANDLERS[data_source](split, test_size, random_seed)
+
+    return DATA_SOURCE_HANDLERS[data_source](split, test_size, random_seed, **kwargs)

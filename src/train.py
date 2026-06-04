@@ -22,6 +22,8 @@ timestamp = datetime.now().strftime('%Y%m%d_%H%M')
 MODEL_MAPPING = {
     "cnn": models.CNN_MLP,
     "ssl": models.WAV_LM,
+    "rhythm_regressor": models.RhythmRegressor,
+    "duration_regressor": models.DurationRegressor,
 }
 
 COLLATE_FUNC_MAPPING = {
@@ -88,7 +90,8 @@ def train(config):
     task_spec = get_task_spec(task)
     is_regression = task_spec.is_regression
     
-    # Get target normalization stats for regression (needed before loading datasets)
+    # Get target normalization stats for regression
+    # If not provided, compute from training data
     target_mean = config['model_params'].get('target_mean')
     target_std = config['model_params'].get('target_std')
     
@@ -102,18 +105,38 @@ def train(config):
     for key, value in config.items():
         logger.info(f"  {key}: {value}")
     
+    # Load VC features for duration_regressor
+    vc_features = None
+    num_tokens = None
+    if config.get('model_type') == 'duration_regressor':
+        vc_path = config['dataset_params'].get('vc_features_path', 'data/speechocean/vc_features.json')
+        with open(vc_path, 'r') as f:
+            vc_data = json.load(f)
+        vc_features = vc_data['samples']
+        num_tokens = len(vc_data['vocab'])
+        logger.info(f"Loaded VC features: {len(vc_features)} samples, {num_tokens} tokens")
+
     # Load datasets
     logger.info("\n" + "-"*70)
     logger.info("Loading datasets...")
     
     # Pass normalization stats to dataset for regression tasks
     dataset_params = config['dataset_params'].copy()
+    dataset_params.pop('vc_features_path', None)
     if is_regression and target_mean is not None and target_std is not None:
         dataset_params['target_mean'] = target_mean
         dataset_params['target_std'] = target_std
         logger.info(f"Target normalization: mean={target_mean}, std={target_std}")
     
-    train_dataset = DatasetLMDB(**dataset_params, split='Train')
+    train_dataset = DatasetLMDB(**dataset_params, split='Train', vc_features=vc_features)
+
+    if is_regression and target_mean is None:
+        raw_labels = np.array([float(v) for v in train_dataset.labels.values()])
+        target_mean = float(np.mean(raw_labels))
+        target_std = float(np.std(raw_labels))
+        train_dataset.target_mean = target_mean
+        train_dataset.target_std = target_std
+        logger.info(f"Auto-computed target normalization: mean={target_mean:.4f}, std={target_std:.4f}")
 
     utterance_embed_dim = config['model_params'].get('utterance_embed_dim', 0)
     train_utterance_str2int = None
@@ -126,10 +149,14 @@ def train(config):
 
     dev_dataset = DatasetLMDB(**dataset_params, split='Development',
                               external_utterance_str2int=train_utterance_str2int,
-                              external_utterance_int2str=train_utterance_int2str)
+                              external_utterance_int2str=train_utterance_int2str,
+                              vc_features=vc_features,
+                              target_mean=target_mean, target_std=target_std)
     test_dataset = DatasetLMDB(**dataset_params, split='Test',
                                external_utterance_str2int=train_utterance_str2int,
-                               external_utterance_int2str=train_utterance_int2str)
+                               external_utterance_int2str=train_utterance_int2str,
+                               vc_features=vc_features,
+                               target_mean=target_mean, target_std=target_std)
 
     # Compute class/label distribution on train
     from collections import Counter
@@ -173,6 +200,8 @@ def train(config):
     logger.info("\n" + "-"*70)
     logger.info("Initializing model...")
     model_kwargs = {**config['model_params']}
+    if num_tokens is not None:
+        model_kwargs['num_tokens'] = num_tokens
     if utterance_embed_dim > 0:
         model_kwargs['num_utterances'] = len(train_utterance_str2int)
     model = MODEL_MAPPING.get(config['model_type'])(
@@ -342,7 +371,8 @@ def train(config):
             save_checkpoint(
                 model, optimizer, epoch+1, avg_train_loss, epoch_metrics[train_metric_key],
                 val_loss, epoch_metrics[val_metric_key], checkpoints_dir, logger, is_best=True,
-                utterance_str2int=train_utterance_str2int
+                utterance_str2int=train_utterance_str2int,
+                target_mean=target_mean, target_std=target_std
             )
         else:
             epochs_without_improvement += 1
@@ -410,7 +440,8 @@ def train(config):
             save_checkpoint(
                 model, optimizer, epoch+1, avg_train_loss, epoch_metrics[train_metric_key],
                 val_loss, epoch_metrics[val_metric_key], checkpoints_dir, logger, is_best=False,
-                utterance_str2int=train_utterance_str2int
+                utterance_str2int=train_utterance_str2int,
+                target_mean=target_mean, target_std=target_std
             )
     
     # Final plot
@@ -435,7 +466,8 @@ def train(config):
         epoch_metrics['train_loss'], epoch_metrics[train_metric_key],
         epoch_metrics['val_loss'], epoch_metrics[val_metric_key],
         checkpoints_dir, logger, is_best=False,
-        utterance_str2int=train_utterance_str2int
+        utterance_str2int=train_utterance_str2int,
+        target_mean=target_mean, target_std=target_std
     )
     
     # Final evaluation on test set

@@ -1,0 +1,31 @@
+{
+  "exp_name": "duration_contrastive_arctic",
+  "collate_fn": "pad",
+  "model_params": {
+    "lstm_hidden_size": 64,
+    "lstm_num_layers": 1,
+    "lstm_bidirectional": true,
+    "dropout": 0.1,
+    "proj_hidden_dim": 128,
+    "proj_out_dim": 64,
+    "proj_num_layers": 2,
+    "proj_dropout": 0.0
+  },
+  "dataset_params": {
+    "lmdb_path": "data/arctic/rtm_feats_bark_f0_egemaps.lmdb",
+    "data_source": "arctic_contrastive",
+    "items": ["v_dur", "c_dur"],
+    "vc_features_path": "data/arctic/vc_durations.json",
+    "test_size": 0.05
+  },
+  "training_params": {
+    "learning_rate": 1e-3,
+    "num_epochs": 500,
+    "weight_decay": 1e-4,
+    "temperature": 0.07,
+    "utterances_per_batch": 8,
+    "l1_per_utterance": 5,
+    "l2_per_utterance": 15,
+    "use_scheduler": false
+  }
+}

@@ -2,6 +2,7 @@ from pathlib import Path
 import logging
 from datetime import datetime
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import os
 
@@ -190,7 +191,8 @@ def plot_regression_curves(train_losses, train_rmses, train_pearson_rs,
     return plot_file
 
 def save_checkpoint(model, optimizer, epoch, train_loss, train_acc, val_loss, val_acc, 
-                   checkpoints_dir, logger, is_best=False, utterance_str2int=None):
+                   checkpoints_dir, logger, is_best=False, utterance_str2int=None,
+                   target_mean=None, target_std=None):
     """
     Save model checkpoint.
     """
@@ -205,6 +207,9 @@ def save_checkpoint(model, optimizer, epoch, train_loss, train_acc, val_loss, va
     }
     if utterance_str2int is not None:
         checkpoint['utterance_str2int'] = utterance_str2int
+    if target_mean is not None:
+        checkpoint['target_mean'] = target_mean
+        checkpoint['target_std'] = target_std
     
     if is_best:
         # Delete previous best model
@@ -562,3 +567,123 @@ def quantize_values(values, mean, std, num_bins=32, min_val=-3.0, max_val=3.0):
     bins = torch.clamp(bins, 0, num_bins - 1)
     
     return bins
+
+
+def plot_latent_space(encoder, dataloader, output_path, device, max_samples=2000):
+    """
+    Visualize the learned latent space using UMAP.
+    Runs the encoder on samples and produces a 2D scatter plot colored by L1 vs L2.
+
+    Args:
+        encoder: RhythmEncoder (or RhythmContrastiveModel) that returns embeddings
+        dataloader: DataLoader yielding batches with 'envelope' and 'label'
+        output_path: Path to save the plot
+        device: torch device
+        max_samples: Maximum number of samples to use for visualization
+    """
+    import umap
+
+    encoder.eval()
+    all_embeddings = []
+    all_labels = []
+    is_duration_model = hasattr(encoder, 'lstm_v') and not hasattr(encoder, 'encoder')
+
+    with torch.no_grad():
+        for batch in dataloader:
+            labels = batch['label'].cpu().numpy()
+
+            if is_duration_model:
+                emb = encoder(batch['v_dur'].to(device), batch['c_dur'].to(device))
+            elif hasattr(encoder, 'encoder'):
+                x = batch['envelope'].to(device)
+                phoneme_ids = batch.get('phoneme_ids')
+                phoneme_lengths = batch.get('phoneme_lengths')
+                if phoneme_ids is not None:
+                    emb, _ = encoder.encoder(x, phoneme_ids.to(device), phoneme_lengths.to(device))
+                else:
+                    emb, _ = encoder.encoder(x, None, None)
+            else:
+                emb = encoder(batch['envelope'].to(device))
+
+            all_embeddings.append(emb.cpu().numpy() if isinstance(emb, torch.Tensor) else emb[0].cpu().numpy())
+            all_labels.append(labels)
+
+            if sum(len(e) for e in all_embeddings) >= max_samples:
+                break
+
+    all_embeddings = np.concatenate(all_embeddings, axis=0)[:max_samples]
+    all_labels = np.concatenate(all_labels, axis=0)[:max_samples]
+
+    reducer = umap.UMAP(n_components=2, random_state=42)
+    reduced = reducer.fit_transform(all_embeddings)
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+
+    l1_mask = all_labels == 0
+    l2_mask = all_labels == 1
+
+    ax.scatter(reduced[l1_mask, 0], reduced[l1_mask, 1], c='steelblue', label='L1 (native)',
+               alpha=0.6, s=10, edgecolors='none')
+    ax.scatter(reduced[l2_mask, 0], reduced[l2_mask, 1], c='coral', label='L2 (non-native)',
+               alpha=0.6, s=10, edgecolors='none')
+
+    ax.set_xlabel('UMAP 1')
+    ax.set_ylabel('UMAP 2')
+    ax.set_title('Rhythm Encoder Latent Space (UMAP)')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(output_path, bbox_inches='tight', dpi=150)
+    plt.close()
+
+
+def compute_val_centroid_distance(model, val_loader, device, use_text=False):
+    """
+    Per-utterance L1-L2 centroid cosine distance, averaged over validation utterances.
+    Higher = better separation of native vs non-native speakers on unseen utterances.
+    Works with both RhythmContrastiveModel and DurationContrastiveModel.
+    """
+    from collections import defaultdict
+    from src.dataloaders import parse_identifier
+
+    model.eval()
+    utt_embs = defaultdict(lambda: {'L1': [], 'L2': []})
+    is_duration_model = hasattr(model, 'lstm_v') and not hasattr(model, 'encoder')
+
+    with torch.no_grad():
+        for batch in val_loader:
+            labels = batch['label']
+            identifiers = batch['identifier']
+
+            if is_duration_model:
+                emb = model(batch['v_dur'].to(device), batch['c_dur'].to(device))
+            elif hasattr(model, 'encoder') and use_text:
+                emb, _ = model(batch['envelope'].to(device),
+                               batch['phoneme_ids'].to(device),
+                               batch['phoneme_lengths'].to(device))
+            elif hasattr(model, 'encoder'):
+                emb, _ = model(batch['envelope'].to(device))
+            else:
+                emb = model(batch['envelope'].to(device))
+
+            emb_np = emb.cpu().numpy() if isinstance(emb, torch.Tensor) else emb[0].cpu().numpy()
+
+            for i, identifier in enumerate(identifiers):
+                _, utt_id = parse_identifier(identifier)
+                cat = 'L1' if labels[i].item() == 0 else 'L2'
+                utt_embs[utt_id][cat].append(emb_np[i])
+
+    distances = []
+    for utt_id, groups in utt_embs.items():
+        if len(groups['L1']) == 0 or len(groups['L2']) == 0:
+            continue
+        c_l1 = np.mean(groups['L1'], axis=0)
+        c_l2 = np.mean(groups['L2'], axis=0)
+        cos_sim = np.dot(c_l1, c_l2) / (np.linalg.norm(c_l1) * np.linalg.norm(c_l2) + 1e-8)
+        distances.append(1.0 - cos_sim)
+
+    if not distances:
+        return 0.0
+
+    return float(np.mean(distances))

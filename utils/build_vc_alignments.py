@@ -35,10 +35,12 @@ def build_vc_segments(phones, intervals, durations):
     v_intervals = []
     v_durations = []
     v_phones = []
+    v_phone_durs = []
 
     c_intervals = []
     c_durations = []
     c_phones = []
+    c_phone_durs = []
 
     # Which segment type we're currently accumulating
     # True = V, False = C, None = haven't started yet
@@ -48,6 +50,7 @@ def build_vc_segments(phones, intervals, durations):
     cur_end = None
     cur_dur = 0.0
     cur_phones = []
+    cur_phone_durs = []
 
     for phone, (start, end), dur in zip(phones, intervals, durations):
         is_v = _is_vowel(phone) and not _is_silence(phone)
@@ -59,27 +62,32 @@ def build_vc_segments(phones, intervals, durations):
             cur_end = end
             cur_dur = dur
             cur_phones = [phone]
+            cur_phone_durs = [round(dur, 6)]
         elif in_v == is_v:
             # Continuing same segment type
             cur_end = end
             cur_dur += dur
             cur_phones.append(phone)
+            cur_phone_durs.append(round(dur, 6))
         else:
             # Transition: close current segment, start new one
             if in_v:
                 v_intervals.append([cur_start, cur_end])
                 v_durations.append(round(cur_dur, 6))
                 v_phones.append(cur_phones)
+                v_phone_durs.append(cur_phone_durs)
             else:
                 c_intervals.append([cur_start, cur_end])
                 c_durations.append(round(cur_dur, 6))
                 c_phones.append(cur_phones)
+                c_phone_durs.append(cur_phone_durs)
 
             in_v = is_v
             cur_start = start
             cur_end = end
             cur_dur = dur
             cur_phones = [phone]
+            cur_phone_durs = [round(dur, 6)]
 
     # Close final segment
     if cur_phones:
@@ -87,21 +95,25 @@ def build_vc_segments(phones, intervals, durations):
             v_intervals.append([cur_start, cur_end])
             v_durations.append(round(cur_dur, 6))
             v_phones.append(cur_phones)
+            v_phone_durs.append(cur_phone_durs)
         else:
             c_intervals.append([cur_start, cur_end])
             c_durations.append(round(cur_dur, 6))
             c_phones.append(cur_phones)
+            c_phone_durs.append(cur_phone_durs)
 
     return {
         'vocalic': {
             'intervals': v_intervals,
             'durations': v_durations,
             'phones': v_phones,
+            'phone_durs': v_phone_durs,
         },
         'intervocalic': {
             'intervals': c_intervals,
             'durations': c_durations,
             'phones': c_phones,
+            'phone_durs': c_phone_durs,
         },
     }
 

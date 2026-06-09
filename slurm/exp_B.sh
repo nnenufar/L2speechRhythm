@@ -4,7 +4,7 @@
 #SBATCH --error=/home/joao.lima/experiments/rhythm_classifier/slurm/out/enc_r.err
 #SBATCH --ntasks=8
 #SBATCH --gres=gpu:1
-#SBATCH --partition=l40s
+#SBATCH --partition=l40s,a5000,rtx8000,rtx5000
 #SBATCH --time=2-00:00:00
 #SBATCH --mem=30G
 
@@ -14,4 +14,4 @@ export TRANSFORMERS_OFFLINE=1
 source ~/miniconda3/bin/activate
 conda activate rtm
 
-python -m src.train_contrastive --config config/rhythm_encoder_contrastive.json
+python -m src.train_contrastive --config config/exp_B1_env_cont_expand.json

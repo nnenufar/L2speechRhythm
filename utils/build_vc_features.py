@@ -38,8 +38,10 @@ def main():
         c_phone_ids = [[vocab[p] for p in phones] for phones in data['intervocalic']['phones']]
         result[identifier] = {
             'v_phones': v_phone_ids,
+            'v_phone_durs': data['vocalic']['phone_durs'],
             'v_dur': data['vocalic']['durations'],
             'c_phones': c_phone_ids,
+            'c_phone_durs': data['intervocalic']['phone_durs'],
             'c_dur': data['intervocalic']['durations'],
         }
 

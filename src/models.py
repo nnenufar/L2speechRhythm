@@ -4,17 +4,14 @@ from transformers import WavLMModel
 import torch.nn.functional as F
 import torch.nn as nn
 from src.modules import *
-from src.train_utils import quantize_values
 
 
 class RhythmEncoder(nn.Module):
     """
     Encoder for amplitude envelope sequences.
-    CNN + LSTM → attention pooling → embedding
+    CNN + LSTM + attention pooling → embedding.
     """
     def __init__(self,
-                 num_phonemes=0,
-                 use_text=False,
                  feat_dim=1,
                  kernel_size=3,
                  cnn_out_channels=64,
@@ -25,17 +22,16 @@ class RhythmEncoder(nn.Module):
                  lstm_bidirectional=True,
                  attn_hidden_dim=None,
                  attn_pool_mode='sigmoid',
-                 attn_tau=2.0,
+                 attn_tau=0.3,
                  dropout=0.1):
         super().__init__()
 
         self.attn_tau = attn_tau
-        self.use_text = use_text
         audio_dim = lstm_hidden_size * (2 if lstm_bidirectional else 1)
 
         self.cnn_encoder = Conv1dStack(
             in_channels=feat_dim,
-            hidden_channels=cnn_out_channels,
+            hidden_channels=cnn_out_channels * 2,
             out_channels=cnn_out_channels,
             kernel_size=kernel_size,
             num_layers=num_cnn_layers,
@@ -54,28 +50,6 @@ class RhythmEncoder(nn.Module):
             output_mode='all'
         )
 
-        if use_text:
-            self.text_encoder = TextEncoder(
-                vocab_size=num_phonemes,
-                embed_dim=64,
-                conv_channels=128,
-                kernel_size=5,
-                lstm_hidden=lstm_hidden_size,
-                lstm_layers=lstm_num_layers,
-                dropout=dropout
-            )
-
-            text_dim = self.text_encoder.output_dim
-
-            self.cross_attn = AdditiveCrossAttention(
-                query_dim=audio_dim,
-                key_dim=text_dim,
-                attn_dim=64,
-                dropout=dropout
-            )
-
-            self.cross_attn_proj = nn.Linear(audio_dim + text_dim, audio_dim)
-
         self.lstm_attn_pool = AttentionPooling(
             embed_dim=audio_dim,
             hidden_dim=attn_hidden_dim,
@@ -86,7 +60,7 @@ class RhythmEncoder(nn.Module):
 
         self.layer_norm = nn.LayerNorm(self.embed_dim)
 
-    def forward(self, x, phoneme_ids=None, phoneme_lengths=None):
+    def forward(self, x):
         if x.dim() == 2:
             x = x.unsqueeze(1)
 
@@ -95,18 +69,10 @@ class RhythmEncoder(nn.Module):
 
         audio_features = self.lstm_encoder(cnn_out)
 
-        if self.use_text:
-            text_features = self.text_encoder(phoneme_ids, phoneme_lengths)
-            attended, attn_weights = self.cross_attn(audio_features, text_features, phoneme_lengths)
-            enriched = torch.cat([audio_features, attended], dim=-1)
-            audio_features = self.cross_attn_proj(enriched)
-        else:
-            attn_weights = None
-
         embeddings, _ = self.lstm_attn_pool(audio_features, tau=self.attn_tau)
 
         embeddings = self.layer_norm(embeddings)
-        return embeddings, attn_weights
+        return embeddings
 
 
 class RhythmContrastiveModel(nn.Module):
@@ -129,16 +95,19 @@ class RhythmContrastiveModel(nn.Module):
             norm=None
         )
 
-    def forward(self, x, phoneme_ids=None, phoneme_lengths=None):
-        embeddings, attn_weights = self.encoder(x, phoneme_ids, phoneme_lengths)
+    def forward(self, x):
+        embeddings = self.encoder(x)
         projected = self.projection(embeddings)
-        return F.normalize(projected, dim=-1), attn_weights
+        return F.normalize(projected, dim=-1)
 
 
 class RhythmRegressor(nn.Module):
     """
     Pretrained RhythmEncoder + regression head for fluency score prediction.
     Loads encoder weights from a contrastive checkpoint, adds an MLP head.
+
+    freeze_encoder: False (train all), True / "encoder_all" (freeze entire encoder),
+                    or "cnn_only" (freeze CNN stack, train LSTM + attention pool).
     """
     def __init__(self, pretrained_checkpoint=None, freeze_encoder=True,
                  hidden_size=32, dropout=0.1, **kwargs):
@@ -155,49 +124,45 @@ class RhythmRegressor(nn.Module):
                              if k.startswith('encoder.')}
             self.encoder.load_state_dict(encoder_state, strict=False)
 
-        if freeze_encoder:
+        if freeze_encoder is True or freeze_encoder == 'encoder_all':
             for p in self.encoder.parameters():
                 p.requires_grad = False
-
-        self.use_text = self.encoder.use_text
+        elif freeze_encoder == 'cnn_only':
+            for p in self.encoder.cnn_encoder.parameters():
+                p.requires_grad = False
 
         self.head = MLP(
             in_features=self.encoder.embed_dim,
             hidden_features=hidden_size,
             out_features=1,
-            num_layers=2,
+            num_layers=1,
             activation='relu',
             dropout=dropout,
             norm='layer'
         )
 
     def forward(self, batch, return_attention=False):
-        x = batch['envelope']
-
-        if self.use_text:
-            emb, attn_weights = self.encoder(
-                x, batch['phoneme_ids'], batch['phoneme_lengths']
-            )
-        else:
-            emb, attn_weights = self.encoder(x)
-
+        emb = self.encoder(batch['envelope'])
         out = self.head(emb).squeeze(-1)
-
-        if return_attention and attn_weights is not None:
-            return out, attn_weights
+        if return_attention:
+            return out, None
         return out
 
 
 class DurationRegressor(nn.Module):
     """
     Vocalic + intervocalic interval sequences → LSTM → attention pooling → regression.
-    Multi-phone intervals are mean-pooled from individual phone embeddings.
+    Each phone in an interval is embedded individually, concatenated with its per-phone
+    duration, then all sub-segments are concatenated (padded to max_phones) and appended
+    with the total interval duration.
     """
     def __init__(self, num_tokens, phone_embed_dim=64, lstm_hidden_size=64,
-                 lstm_num_layers=1, dropout=0.1, hidden_size=32, **kwargs):
+                 lstm_num_layers=1, dropout=0.1, hidden_size=32, max_phones=5,
+                 **kwargs):
         super().__init__()
 
-        input_dim = phone_embed_dim + 1
+        self.max_phones = max_phones
+        input_dim = (phone_embed_dim + 1) * max_phones + 1
         lstm_out = lstm_hidden_size * 2
 
         self.phone_embedding = nn.Embedding(num_tokens, phone_embed_dim, padding_idx=0)
@@ -226,16 +191,25 @@ class DurationRegressor(nn.Module):
             dropout=dropout, norm='layer'
         )
 
-    def _embed_intervals(self, phones, plen, dur):
+    def _embed_intervals(self, phones, phone_durs, dur):
+        L = phones.size(-1)
         emb = self.phone_embedding(phones)
-        mask = torch.arange(phones.size(-1), device=phones.device).unsqueeze(0).unsqueeze(0)
-        mask = (mask < plen.unsqueeze(-1)).float().unsqueeze(-1)
-        pooled = (emb * mask).sum(dim=2) / plen.unsqueeze(-1).clamp(min=1)
-        return torch.cat([pooled, dur.unsqueeze(-1)], dim=-1)
+
+        if L < self.max_phones:
+            emb = F.pad(emb, (0, 0, 0, self.max_phones - L))
+            phone_durs = F.pad(phone_durs, (0, self.max_phones - L))
+        elif L > self.max_phones:
+            emb = emb[:, :, :self.max_phones, :]
+            phone_durs = phone_durs[:, :, :self.max_phones]
+
+        subseg = torch.cat([emb, phone_durs.unsqueeze(-1)], dim=-1)
+
+        flat = subseg.reshape(*subseg.shape[:-2], -1)
+        return torch.cat([flat, dur.unsqueeze(-1)], dim=-1)
 
     def forward(self, batch, return_attention=False):
-        v_feat = self._embed_intervals(batch['v_phones'], batch['v_plen'], batch['v_dur'])
-        c_feat = self._embed_intervals(batch['c_phones'], batch['c_plen'], batch['c_dur'])
+        v_feat = self._embed_intervals(batch['v_phones'], batch['v_phone_durs'], batch['v_dur'])
+        c_feat = self._embed_intervals(batch['c_phones'], batch['c_phone_durs'], batch['c_dur'])
 
         v_lengths = (batch['v_dur'] != 0).sum(dim=1).clamp(min=1)
         c_lengths = (batch['c_dur'] != 0).sum(dim=1).clamp(min=1)

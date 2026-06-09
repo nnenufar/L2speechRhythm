@@ -191,8 +191,7 @@ def plot_regression_curves(train_losses, train_rmses, train_pearson_rs,
     return plot_file
 
 def save_checkpoint(model, optimizer, epoch, train_loss, train_acc, val_loss, val_acc, 
-                   checkpoints_dir, logger, is_best=False, utterance_str2int=None,
-                   target_mean=None, target_std=None):
+                   checkpoints_dir, logger, is_best=False, utterance_str2int=None):
     """
     Save model checkpoint.
     """
@@ -207,9 +206,6 @@ def save_checkpoint(model, optimizer, epoch, train_loss, train_acc, val_loss, va
     }
     if utterance_str2int is not None:
         checkpoint['utterance_str2int'] = utterance_str2int
-    if target_mean is not None:
-        checkpoint['target_mean'] = target_mean
-        checkpoint['target_std'] = target_std
     
     if is_best:
         # Delete previous best model
@@ -595,13 +591,7 @@ def plot_latent_space(encoder, dataloader, output_path, device, max_samples=2000
             if is_duration_model:
                 emb = encoder(batch['v_dur'].to(device), batch['c_dur'].to(device))
             elif hasattr(encoder, 'encoder'):
-                x = batch['envelope'].to(device)
-                phoneme_ids = batch.get('phoneme_ids')
-                phoneme_lengths = batch.get('phoneme_lengths')
-                if phoneme_ids is not None:
-                    emb, _ = encoder.encoder(x, phoneme_ids.to(device), phoneme_lengths.to(device))
-                else:
-                    emb, _ = encoder.encoder(x, None, None)
+                emb = encoder(batch['envelope'].to(device))
             else:
                 emb = encoder(batch['envelope'].to(device))
 
@@ -638,7 +628,7 @@ def plot_latent_space(encoder, dataloader, output_path, device, max_samples=2000
     plt.close()
 
 
-def compute_val_centroid_distance(model, val_loader, device, use_text=False):
+def compute_val_centroid_distance(model, val_loader, device):
     """
     Per-utterance L1-L2 centroid cosine distance, averaged over validation utterances.
     Higher = better separation of native vs non-native speakers on unseen utterances.
@@ -658,12 +648,8 @@ def compute_val_centroid_distance(model, val_loader, device, use_text=False):
 
             if is_duration_model:
                 emb = model(batch['v_dur'].to(device), batch['c_dur'].to(device))
-            elif hasattr(model, 'encoder') and use_text:
-                emb, _ = model(batch['envelope'].to(device),
-                               batch['phoneme_ids'].to(device),
-                               batch['phoneme_lengths'].to(device))
             elif hasattr(model, 'encoder'):
-                emb, _ = model(batch['envelope'].to(device))
+                emb = model(batch['envelope'].to(device))
             else:
                 emb = model(batch['envelope'].to(device))
 

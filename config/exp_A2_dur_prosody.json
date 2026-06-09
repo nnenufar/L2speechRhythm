@@ -1,0 +1,32 @@
+{
+  "exp_name": "exp_A2c_dur_prosody",
+  "model_type": "duration_regressor",
+  "batch_size": 64,
+  "collate_fn": "pad",
+  "model_params": {
+    "phone_embed_dim": 16,
+    "lstm_hidden_size": 64,
+    "lstm_num_layers": 1,
+    "lstm_bidirectional": true,
+    "dropout": 0.2,
+    "hidden_size": 32,
+    "task": "regression"
+  },
+  "dataset_params": {
+    "lmdb_path": "data/speechocean/rtm_feats.lmdb",
+    "data_source": "speechocean_custom",
+    "items": ["v_phones", "v_plen", "v_phone_durs", "v_dur", "c_phones", "c_plen", "c_phone_durs", "c_dur"],
+    "test_size": 0.2,
+    "vc_features_path": "data/speechocean/vc_features.json",
+    "label_column": "prosodic"
+  },
+  "training_params": {
+    "learning_rate": 1e-4,
+    "num_epochs": 500,
+    "weight_decay": 1e-5,
+    "plot_every": 20,
+    "save_every": 20,
+    "use_early_stopping": true,
+    "early_stop_patience": 50
+  }
+}

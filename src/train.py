@@ -3,17 +3,20 @@ import torch.optim as optim
 import json
 import argparse
 import numpy as np
+import pandas as pd
+import lmdb
 from datetime import datetime
 import wandb
 from src import models
 from src.task_spec import get_task_spec
 from src.train_utils import (
     setup_experiment_dir, setup_logger, plot_training_curves, 
-    save_checkpoint, create_weighted_sampler,
+    save_checkpoint,
     plot_attention_weights, plot_attention_summary,
     plot_regression_curves
 )
 from src.dataloaders import DatasetLMDB, collate_fn, processor_ssl
+from src.evaluation import collect_regression_predictions
 from torch.utils.data import DataLoader
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -90,8 +93,7 @@ def train(config):
     task_spec = get_task_spec(task)
     is_regression = task_spec.is_regression
     
-    # Get target normalization stats for regression
-    # If not provided, compute from training data
+    # Get target normalization stats for regression (needed before loading datasets)
     target_mean = config['model_params'].get('target_mean')
     target_std = config['model_params'].get('target_std')
     
@@ -108,13 +110,18 @@ def train(config):
     # Load VC features for duration_regressor
     vc_features = None
     num_tokens = None
+    max_phones = None
     if config.get('model_type') == 'duration_regressor':
         vc_path = config['dataset_params'].get('vc_features_path', 'data/speechocean/vc_features.json')
         with open(vc_path, 'r') as f:
             vc_data = json.load(f)
         vc_features = vc_data['samples']
         num_tokens = len(vc_data['vocab'])
-        logger.info(f"Loaded VC features: {len(vc_features)} samples, {num_tokens} tokens")
+        max_v = max(max(len(p) for p in s.get('v_phones', [])) for s in vc_features.values())
+        max_c = max(max(len(p) for p in s.get('c_phones', [])) for s in vc_features.values())
+        max_phones = max(max_v, max_c)
+        logger.info(f"Loaded VC features: {len(vc_features)} samples, {num_tokens} tokens, "
+                    f"max_phones V={max_v} C={max_c}")
 
     # Load datasets
     logger.info("\n" + "-"*70)
@@ -128,15 +135,9 @@ def train(config):
         dataset_params['target_std'] = target_std
         logger.info(f"Target normalization: mean={target_mean}, std={target_std}")
     
-    train_dataset = DatasetLMDB(**dataset_params, split='Train', vc_features=vc_features)
+    lmdb_env = lmdb.open(dataset_params['lmdb_path'], readonly=True, lock=False, readahead=False, meminit=False)
 
-    if is_regression and target_mean is None:
-        raw_labels = np.array([float(v) for v in train_dataset.labels.values()])
-        target_mean = float(np.mean(raw_labels))
-        target_std = float(np.std(raw_labels))
-        train_dataset.target_mean = target_mean
-        train_dataset.target_std = target_std
-        logger.info(f"Auto-computed target normalization: mean={target_mean:.4f}, std={target_std:.4f}")
+    train_dataset = DatasetLMDB(**dataset_params, split='Train', vc_features=vc_features, env=lmdb_env)
 
     utterance_embed_dim = config['model_params'].get('utterance_embed_dim', 0)
     train_utterance_str2int = None
@@ -150,13 +151,11 @@ def train(config):
     dev_dataset = DatasetLMDB(**dataset_params, split='Development',
                               external_utterance_str2int=train_utterance_str2int,
                               external_utterance_int2str=train_utterance_int2str,
-                              vc_features=vc_features,
-                              target_mean=target_mean, target_std=target_std)
+                              vc_features=vc_features, env=lmdb_env)
     test_dataset = DatasetLMDB(**dataset_params, split='Test',
                                external_utterance_str2int=train_utterance_str2int,
                                external_utterance_int2str=train_utterance_int2str,
-                               vc_features=vc_features,
-                               target_mean=target_mean, target_std=target_std)
+                               vc_features=vc_features, env=lmdb_env)
 
     # Compute class/label distribution on train
     from collections import Counter
@@ -172,25 +171,14 @@ def train(config):
     else:
         logger.info(f"Train class distribution: {dict(train_label_counts)}")
 
-    # Optional WeightedRandomSampler (only for classification)
-    use_weighted_sampler = config['training_params'].get('use_weighted_sampler', False) and not is_regression
-
     collateFunc = COLLATE_FUNC_MAPPING.get(config['collate_fn'])
 
-    if use_weighted_sampler:
-        train_sampler = create_weighted_sampler(train_dataset, train_label_counts)
-        train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], collate_fn=collateFunc, sampler=train_sampler)
-        dev_sampler = create_weighted_sampler(dev_dataset, dev_label_counts)
-        dev_loader = DataLoader(dev_dataset, batch_size=config['batch_size'], collate_fn=collateFunc, sampler=dev_sampler)
-        test_sampler = create_weighted_sampler(test_dataset, test_label_counts)
-        test_loader = DataLoader(test_dataset, batch_size=config['batch_size'], collate_fn=collateFunc, sampler=test_sampler)
-    else:
-        train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], 
-                                  collate_fn=collateFunc, shuffle=True)
-        dev_loader = DataLoader(dev_dataset, batch_size=config['batch_size'], 
-                                collate_fn=collateFunc, shuffle=False)
-        test_loader = DataLoader(test_dataset, batch_size=config['batch_size'], 
-                                collate_fn=collateFunc, shuffle=False)
+    train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], 
+                              collate_fn=collateFunc, shuffle=True)
+    dev_loader = DataLoader(dev_dataset, batch_size=config['batch_size'], 
+                            collate_fn=collateFunc, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=config['batch_size'], 
+                            collate_fn=collateFunc, shuffle=False)
     
     num_classes = len(train_dataset.labels_str2int)
     logger.info(f"Sucessfully loaded dataset\nNumber of classes/unique values: {num_classes}\nLabel mapping: {train_dataset.labels_str2int}")
@@ -202,6 +190,8 @@ def train(config):
     model_kwargs = {**config['model_params']}
     if num_tokens is not None:
         model_kwargs['num_tokens'] = num_tokens
+    if max_phones is not None:
+        model_kwargs['max_phones'] = max_phones
     if utterance_embed_dim > 0:
         model_kwargs['num_utterances'] = len(train_utterance_str2int)
     model = MODEL_MAPPING.get(config['model_type'])(
@@ -223,17 +213,6 @@ def train(config):
         lr=config['training_params']['learning_rate'],
         weight_decay=config['training_params']['weight_decay']
     )
-    use_scheduler = config['training_params'].get('use_scheduler')
-
-    if use_scheduler:
-        scheduler = optim.lr_scheduler.OneCycleLR(
-                    optimizer,
-                    max_lr=config['training_params'].get('max_lr', 0.01),
-                    epochs=config['training_params']['num_epochs'],
-                    steps_per_epoch=len(train_loader),
-                    pct_start=config['training_params'].get('warmup_pct', 0.1),
-                    anneal_strategy='cos'
-                    )
     
     # Training tracking
     train_losses = []
@@ -254,6 +233,7 @@ def train(config):
     
     best_val_loss = float('inf')
     best_val_metric = -float('inf') if task_spec.higher_is_better else float('inf')
+    best_model_path = None
     epochs_without_improvement = 0
     
     plot_every = config['training_params'].get('plot_every', 5)
@@ -292,11 +272,9 @@ def train(config):
             loss.backward()
             
             # Gradient clipping to prevent exploding gradients
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             
             optimizer.step()
-            if use_scheduler:
-                scheduler.step()
             
             # Calculate metrics
             train_loss += loss.item()
@@ -339,18 +317,13 @@ def train(config):
             val_f1s.append(val_metrics['f1'])
         
         # Log epoch summary
-        lr_value = scheduler.get_last_lr()[0] if use_scheduler else config['training_params']['learning_rate']
+        lr_value = config['training_params']['learning_rate']
         epoch_metrics = build_epoch_metrics(avg_train_loss, train_metrics, val_metrics, lr_value)
 
         logger.info("-"*70)
         logger.info(f"Epoch [{epoch+1}/{config['training_params']['num_epochs']}] Summary:")
         for line in task_spec.summary_lines(epoch_metrics):
             logger.info(line)
-        
-        if use_scheduler:
-            logger.info(f"  Learning Rate: {lr_value:.6f} (Using Scheduler)")
-        else:
-            logger.info(f"  Learning Rate: {lr_value:.6f} (Not using Scheduler)")
         
         # Log metrics to wandb
         if wandb_enabled:
@@ -371,9 +344,9 @@ def train(config):
             save_checkpoint(
                 model, optimizer, epoch+1, avg_train_loss, epoch_metrics[train_metric_key],
                 val_loss, epoch_metrics[val_metric_key], checkpoints_dir, logger, is_best=True,
-                utterance_str2int=train_utterance_str2int,
-                target_mean=target_mean, target_std=target_std
+                utterance_str2int=train_utterance_str2int
             )
+            best_model_path = checkpoints_dir / f'best_model_epoch{epoch+1}.pth'
         else:
             epochs_without_improvement += 1
         
@@ -440,8 +413,7 @@ def train(config):
             save_checkpoint(
                 model, optimizer, epoch+1, avg_train_loss, epoch_metrics[train_metric_key],
                 val_loss, epoch_metrics[val_metric_key], checkpoints_dir, logger, is_best=False,
-                utterance_str2int=train_utterance_str2int,
-                target_mean=target_mean, target_std=target_std
+                utterance_str2int=train_utterance_str2int
             )
     
     # Final plot
@@ -466,17 +438,71 @@ def train(config):
         epoch_metrics['train_loss'], epoch_metrics[train_metric_key],
         epoch_metrics['val_loss'], epoch_metrics[val_metric_key],
         checkpoints_dir, logger, is_best=False,
-        utterance_str2int=train_utterance_str2int,
-        target_mean=target_mean, target_std=target_std
+        utterance_str2int=train_utterance_str2int
     )
     
     # Final evaluation on test set
     logger.info("\n" + "="*70)
     logger.info("Evaluating on test set...")
-    
-    test_metrics = task_spec.eval_metrics(
-        model, test_loader, criterion, device, target_mean, target_std
-    )
+
+    checkpoint_epoch = None
+    if best_model_path is not None and best_model_path.exists():
+        logger.info(f"Loading best model from {best_model_path}")
+        checkpoint = torch.load(best_model_path, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        checkpoint_epoch = checkpoint.get('epoch')
+        logger.info(f"Best model at epoch {checkpoint_epoch} loaded")
+    else:
+        logger.info("No best model checkpoint found; evaluating with current model")
+
+    if is_regression:
+        results = collect_regression_predictions(model, test_loader, device)
+        all_targets = results['targets']
+        all_preds = results['preds']
+        m = results['metrics']
+
+        test_metrics = {
+            'loss': float('nan'),
+            'rmse': m['rmse'],
+            'mae': m['mae'],
+            'pearson_r': m['pearson_r'],
+            'spearman_r': m['spearman_r'],
+        }
+
+        eval_dir = exp_dir / 'eval'
+        eval_dir.mkdir(parents=True, exist_ok=True)
+
+        df = pd.DataFrame({
+            'identifier': results['identifiers'],
+            'ground_truth': all_targets,
+            'prediction': all_preds,
+        })
+        csv_path = eval_dir / f'predictions_Test_{timestamp}.csv'
+        df.to_csv(csv_path, index=False)
+        logger.info(f"Predictions saved to {csv_path}")
+
+        summary = {
+            'exp_name': exp_name,
+            'split': 'Test',
+            'num_samples': m['num_samples'],
+            'rmse': m['rmse'],
+            'mae': m['mae'],
+            'pearson_r': m['pearson_r'],
+            'spearman_r': m['spearman_r'],
+            'checkpoint_epoch': checkpoint_epoch if checkpoint_epoch is not None else len(train_losses),
+            'target_mean': m['target_mean'],
+            'target_std': m['target_std'],
+        }
+        summary_path = eval_dir / f'summary_Test_{timestamp}.json'
+        with open(summary_path, 'w') as f:
+            json.dump(summary, f, indent=2)
+        logger.info(f"Summary saved to {summary_path}")
+
+    else:
+        test_metrics = task_spec.eval_metrics(
+            model, test_loader, criterion, device, target_mean, target_std
+        )
+
     for line in task_spec.test_lines(test_metrics):
         logger.info(line)
 
@@ -485,7 +511,6 @@ def train(config):
             'exp_name': exp_name,
             'timestamp': timestamp,
             'task': 'regression',
-            'test_loss': test_metrics['loss'],
             'test_rmse': test_metrics['rmse'],
             'test_mae': test_metrics['mae'],
             'test_pearson_r': test_metrics['pearson_r'],
@@ -508,7 +533,7 @@ def train(config):
             'total_epochs': len(train_losses),
             'config': config
         }
-    
+
     test_results_file = test_results_dir / f'test_results_{timestamp}.json'
     with open(test_results_file, 'w') as f:
         json.dump(test_results, f, indent=2)
@@ -545,6 +570,8 @@ def train(config):
             wandb.summary['test_accuracy'] = test_metrics['accuracy']
             wandb.summary['test_f1'] = test_metrics['f1']
         wandb.finish()
+
+    lmdb_env.close()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train a sequence classification model.")

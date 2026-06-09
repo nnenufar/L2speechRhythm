@@ -11,6 +11,7 @@ import torch.optim as optim
 import json
 import argparse
 import numpy as np
+import lmdb
 from pathlib import Path
 from datetime import datetime
 import wandb
@@ -69,8 +70,10 @@ def train(config, test_mode=False):
     dataset_kwargs = config['dataset_params'].copy()
     dataset_kwargs.pop('vc_features_path', None)
 
-    train_dataset = DatasetLMDB(**dataset_kwargs, split='Train', vc_features=vc_durations)
-    val_dataset = DatasetLMDB(**dataset_kwargs, split='Development', vc_features=vc_durations)
+    lmdb_env = lmdb.open(dataset_kwargs['lmdb_path'], readonly=True, lock=False, readahead=False, meminit=False)
+
+    train_dataset = DatasetLMDB(**dataset_kwargs, split='Train', vc_features=vc_durations, env=lmdb_env)
+    val_dataset = DatasetLMDB(**dataset_kwargs, split='Development', vc_features=vc_durations, env=lmdb_env)
 
     for ds, name in [(train_dataset, 'Train'), (val_dataset, 'Development')]:
         before = len(ds)
@@ -127,17 +130,6 @@ def train(config, test_mode=False):
         weight_decay=config['training_params'].get('weight_decay', 0.0)
     )
 
-    use_scheduler = config['training_params'].get('use_scheduler', False)
-    if use_scheduler:
-        scheduler = optim.lr_scheduler.OneCycleLR(
-            optimizer,
-            max_lr=config['training_params'].get('max_lr', 0.01),
-            epochs=config['training_params']['num_epochs'],
-            steps_per_epoch=len(train_loader),
-            pct_start=config['training_params'].get('warmup_pct', 0.1),
-            anneal_strategy='cos'
-        )
-
     num_epochs = config['training_params']['num_epochs']
 
     if test_mode:
@@ -187,13 +179,11 @@ def train(config, test_mode=False):
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
-            if use_scheduler:
-                scheduler.step()
 
             epoch_loss += loss.item()
 
         avg_loss = epoch_loss / len(train_loader)
-        val_dist = compute_val_centroid_distance(model, val_loader, device, use_text=False)
+        val_dist = compute_val_centroid_distance(model, val_loader, device)
 
         if epoch == 0:
             model.eval()
@@ -215,7 +205,7 @@ def train(config, test_mode=False):
                 logger.info(f"  [DEBUG val] v_interval counts: {(vd!=0).sum(dim=1).tolist()}")
                 logger.info(f"  [DEBUG val] c_interval counts: {(cd!=0).sum(dim=1).tolist()}")
 
-        lr_value = scheduler.get_last_lr()[0] if use_scheduler else config['training_params']['learning_rate']
+        lr_value = config['training_params']['learning_rate']
 
         logger.info(
             f"Epoch [{epoch+1}/{num_epochs}] | Loss: {avg_loss:.6f} "
@@ -251,6 +241,8 @@ def train(config, test_mode=False):
     if wandb_enabled:
         wandb.summary['best_val_centroid_distance'] = best_val_metric
         wandb.finish()
+
+    lmdb_env.close()
 
     logger.info("=" * 70)
 

@@ -203,12 +203,69 @@ def get_speechocean_data(split, test_size=0.05, random_seed=42, label_column='fl
     return {key: labels_dict[key] for key in files_for_split}
 
 
+def get_speechocean_data_customSplit(split, test_size=0.20, random_seed=42, label_column='fluency'):
+    """
+    Speechocean dataset for fluency/prosodic score regression.
+    Uses random stratified splits over all available data (ignores predefined split column).
+    Returns {identifier: score (float)}.
+    """
+    df = pd.read_csv('data/speechocean/speechocean_metadata.csv')
+
+    na_indices = df.index[df[label_column].isna()]
+    if len(na_indices) > 0:
+        print(f"Dropping {len(na_indices)} entries with missing {label_column} scores "
+              f"at rows: {na_indices.tolist()}")
+        df = df.drop(index=na_indices)
+
+    df[label_column] = df[label_column].astype(float)
+
+    all_identifiers = df['identifier'].values
+    all_scores = df[label_column].values
+
+    assert len(all_identifiers) == len(all_scores), \
+        f"Identifier/scores length mismatch: {len(all_identifiers)} vs {len(all_scores)}"
+
+    score_counts = pd.Series(all_scores).value_counts().to_dict()
+    min_for_stratify = max(int(np.ceil(2.0 / test_size)), 4)
+    rare_scores = {s for s, c in score_counts.items() if c < min_for_stratify}
+    stratify_labels = np.array([-1.0 if s in rare_scores else s for s in all_scores])
+
+    if rare_scores:
+        print(f"Binning {len(rare_scores)} rare score classes for stratification: "
+              f"{sorted(rare_scores)} (total {int((stratify_labels == -1.0).sum())} samples)")
+
+    train_ids, temp_ids, train_scores, temp_scores = train_test_split(
+        all_identifiers, all_scores,
+        test_size=test_size, random_state=random_seed, stratify=stratify_labels
+    )
+
+    temp_stratify = np.array([-1.0 if s in rare_scores else s for s in temp_scores])
+    dev_ids, test_ids, _, _ = train_test_split(
+        temp_ids, temp_scores,
+        test_size=0.50, random_state=random_seed, stratify=temp_stratify
+    )
+
+    split_map = {
+        "Train": train_ids,
+        "Development": dev_ids,
+        "Test": test_ids
+    }
+
+    print(f"Speechocean custom splits — Train: {len(train_ids)}, Dev: {len(dev_ids)}, "
+          f"Test: {len(test_ids)}")
+
+    files_for_split = split_map.get(split)
+    labels_dict = df.set_index('identifier')[label_column].to_dict()
+    return {key: labels_dict[key] for key in files_for_split}
+
+
 # Registry of data source handlers
 DATA_SOURCE_HANDLERS = {
     'arctic': get_arctic_data,
     'arctic_regression': get_arctic_data_regression,
     'arctic_contrastive': get_arctic_data_contrastive,
     'speechocean': get_speechocean_data,
+    'speechocean_custom': get_speechocean_data_customSplit,
 }
 
 def get_labels_for_source(data_source, split, test_size, random_seed, **kwargs):

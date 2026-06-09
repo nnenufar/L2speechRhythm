@@ -3,8 +3,6 @@
 #SBATCH --output=/home/joao.lima/experiments/rhythm_classifier/slurm/out/rhythm_scr_%j.out
 #SBATCH --error=/home/joao.lima/experiments/rhythm_classifier/slurm/out/rhythm_scr_%j.err
 #SBATCH --ntasks=8
-#SBATCH --gres=gpu:1
-#SBATCH --partition=l40s,a5000
 #SBATCH --time=1-00:00:00
 #SBATCH --mem=15G
 

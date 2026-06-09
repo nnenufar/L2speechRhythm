@@ -16,11 +16,10 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 from datetime import datetime
-from sklearn.metrics import mean_squared_error, mean_absolute_error
-from scipy.stats import pearsonr, spearmanr
 
 from src.models import RhythmRegressor
 from src.dataloaders import DatasetLMDB, collate_fn
+from src.evaluation import collect_regression_predictions
 from torch.utils.data import DataLoader
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -42,82 +41,34 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime('%Y%m%d_%H%M')
 
-    target_mean = config['model_params'].get('target_mean')
-    target_std = config['model_params'].get('target_std')
-
-    task = config['model_params'].get('task', 'classification')
-    is_regression = task == 'regression'
-
     dataset = DatasetLMDB(
         config['dataset_params']['lmdb_path'],
         data_source=config['dataset_params']['data_source'],
         split=args.split,
         items=config['dataset_params']['items'],
         test_size=config['dataset_params'].get('test_size', 0.20),
-        target_mean=target_mean,
-        target_std=target_std,
+        label_column=config['dataset_params'].get('label_column', 'fluency'),
     )
-
-    if is_regression and target_mean is None:
-        raw_labels = np.array([float(v) for v in dataset.labels.values()])
-        target_mean = float(np.mean(raw_labels))
-        target_std = float(np.std(raw_labels))
-        dataset.target_mean = target_mean
-        dataset.target_std = target_std
-        print(f"Auto-computed target normalization: mean={target_mean:.4f}, std={target_std:.4f}")
-
     print(f"Split: {args.split}, samples: {len(dataset)}")
 
     model = RhythmRegressor(**config['model_params']).to(device)
     checkpoint = torch.load(args.checkpoint, map_location=device)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
-
-    if target_mean is None:
-        target_mean = checkpoint.get('target_mean')
-        target_std = checkpoint.get('target_std')
-
     print(f"Loaded checkpoint epoch {checkpoint.get('epoch', '?')}")
 
     dataloader = DataLoader(dataset, batch_size=64, collate_fn=collate_fn, shuffle=False)
 
-    all_identifiers = []
-    all_targets = []
-    all_preds = []
+    results = collect_regression_predictions(model, dataloader, device)
+    m = results['metrics']
 
-    with torch.no_grad():
-        for batch in dataloader:
-            batch_dev = {k: v.to(device) if isinstance(v, torch.Tensor) else v
-                        for k, v in batch.items()}
-            targets = batch_dev['label'].cpu().numpy()
-            outputs = model(batch_dev)
-            preds = outputs.cpu().numpy()
-
-            all_identifiers.extend(batch['identifier'])
-            all_targets.extend(targets.tolist())
-            all_preds.extend(preds.tolist())
-
-    all_targets = np.array(all_targets)
-    all_preds = np.array(all_preds)
-
-    if is_regression and target_mean is not None and target_std is not None:
-        all_targets_denorm = all_targets * target_std + target_mean
-        all_preds_denorm = all_preds * target_std + target_mean
-    else:
-        all_targets_denorm = all_targets
-        all_preds_denorm = all_preds
-
-    rmse = float(np.sqrt(mean_squared_error(all_targets_denorm, all_preds_denorm)))
-    mae = float(mean_absolute_error(all_targets_denorm, all_preds_denorm))
-    pearson_r, _ = pearsonr(all_targets_denorm, all_preds_denorm)
-    spearman_r, _ = spearmanr(all_targets_denorm, all_preds_denorm)
-
-    print(f"RMSE: {rmse:.4f}, MAE: {mae:.4f}, Pearson r: {pearson_r:.4f}, Spearman r: {spearman_r:.4f}")
+    print(f"RMSE: {m['rmse']:.4f}, MAE: {m['mae']:.4f}, "
+          f"Pearson r: {m['pearson_r']:.4f}, Spearman r: {m['spearman_r']:.4f}")
 
     df = pd.DataFrame({
-        'identifier': all_identifiers,
-        'ground_truth': all_targets_denorm,
-        'prediction': all_preds_denorm,
+        'identifier': results['identifiers'],
+        'ground_truth': results['targets'],
+        'prediction': results['preds'],
     })
     csv_path = output_dir / f'predictions_{args.split}_{ts}.csv'
     df.to_csv(csv_path, index=False)
@@ -126,14 +77,14 @@ def main():
     summary = {
         'exp_name': exp_name,
         'split': args.split,
-        'num_samples': len(all_targets),
-        'rmse': rmse,
-        'mae': mae,
-        'pearson_r': pearson_r,
-        'spearman_r': spearman_r,
+        'num_samples': m['num_samples'],
+        'rmse': m['rmse'],
+        'mae': m['mae'],
+        'pearson_r': m['pearson_r'],
+        'spearman_r': m['spearman_r'],
         'checkpoint_epoch': checkpoint.get('epoch'),
-        'target_mean': target_mean,
-        'target_std': target_std,
+        'target_mean': m['target_mean'],
+        'target_std': m['target_std'],
     }
     summary_path = output_dir / f'summary_{args.split}_{ts}.json'
     with open(summary_path, 'w') as f:

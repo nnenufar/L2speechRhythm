@@ -14,11 +14,9 @@ export TRANSFORMERS_OFFLINE=1
 source ~/miniconda3/bin/activate
 conda activate rtm
 
-CHECKPOINT="/home/joao.lima/experiments/rhythm_classifier/exp/rhythm_encoder_contrastive/checkpoints/20260527_1129/best_model.pth"
+CHECKPOINT="exp/exp_B1_env_cont_expand/checkpoints/20260608_1615/best_model.pth"
 
 python -m src.analyze_encoder \
-    --config config/rhythm_encoder_contrastive.json \
+    --config config/exp_B1_env_cont_expand.json \
     --checkpoint "$CHECKPOINT" \
-    --output_dir analysis/rhythm_encoder \
-    --num_samples_a 8 \
-    --num_utterances_b 6
+    --output_dir exp/exp_B1_env_cont_expand/eval

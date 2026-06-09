@@ -3,9 +3,9 @@ from src.dataloaders import DatasetLMDB
 import json
 from pathlib import Path
 
-DATASET_PATH = 'data/arctic/rtm_feats_bark_f0.lmdb'
-DATA_SOURCE = 'arctic'
-ITEMS = ['f0', 'voiced_mask']
+DATASET_PATH = 'data/speechocean/rtm_feats.lmdb'
+DATA_SOURCE = 'speechocean'
+ITEMS = ['label']
 SPLIT = 'Train'
 
 def main():

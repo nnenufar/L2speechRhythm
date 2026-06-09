@@ -62,7 +62,6 @@ class MLP(nn.Module):
     def forward(self, x):
         return self.mlp(x)
 
-
 class Conv1dBlock(nn.Module):
     """
     A 1D convolutional layer followed by optional normalization, activation, and dropout.
@@ -217,7 +216,7 @@ class AttentionPooling(nn.Module):
         self.norm = nn.LayerNorm(embed_dim) if use_norm else nn.Identity()
         self.dropout = nn.Dropout(dropout) if dropout > 0 else None
 
-    def forward(self, x, mask=None, tau=2.0):
+    def forward(self, x, mask=None, tau=0.3):
         # x: (B, T, C)
         logits = self.score(x).squeeze(-1)  # (B, T)
 

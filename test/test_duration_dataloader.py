@@ -10,7 +10,8 @@ with open('data/speechocean/vc_features.json', 'r') as f:
 vc_features = vc_data['samples']
 num_tokens = len(vc_data['vocab'])
 
-items = ['v_phones', 'v_plen', 'v_dur', 'c_phones', 'c_plen', 'c_dur']
+items = ['v_phones', 'v_plen', 'v_phone_durs', 'v_dur',
+         'c_phones', 'c_plen', 'c_phone_durs', 'c_dur']
 splits = ['Train', 'Development', 'Test']
 
 print("=" * 70)

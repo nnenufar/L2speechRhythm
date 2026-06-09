@@ -111,3 +111,59 @@ def evaluate_regression(model, dataloader, criterion, device, target_mean=None, 
         spearman_r = 0.0
 
     return avg_loss, rmse, mae, pearson_r, spearman_r
+
+
+def collect_regression_predictions(model, dataloader, device):
+    """
+    Run inference on a regression dataset and collect per-sample predictions.
+
+    Args:
+        model: Regression model (outputs a scalar per sample).
+        dataloader: DataLoader iterating over samples with 'identifier' and 'label' keys.
+        device: torch device.
+
+    Returns:
+        results: dict with keys:
+            'identifiers' (list[str]), 'targets' (np.ndarray), 'preds' (np.ndarray),
+            'metrics' (dict with 'rmse', 'mae', 'pearson_r', 'spearman_r',
+                      'target_mean', 'target_std', 'num_samples')
+    """
+    model.eval()
+    all_identifiers = []
+    all_targets = []
+    all_preds = []
+
+    with torch.no_grad():
+        for batch in dataloader:
+            batch_dev = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+                         for k, v in batch.items()}
+            targets = batch_dev['label'].cpu().numpy()
+            outputs = model(batch_dev)
+            preds = outputs.cpu().numpy()
+
+            all_identifiers.extend(batch['identifier'])
+            all_targets.extend(targets.tolist())
+            all_preds.extend(preds.tolist())
+
+    all_targets = np.array(all_targets)
+    all_preds = np.array(all_preds)
+
+    rmse = float(np.sqrt(mean_squared_error(all_targets, all_preds)))
+    mae = float(mean_absolute_error(all_targets, all_preds))
+    pearson_r, _ = pearsonr(all_targets, all_preds)
+    spearman_r, _ = spearmanr(all_targets, all_preds)
+
+    return {
+        'identifiers': all_identifiers,
+        'targets': all_targets,
+        'preds': all_preds,
+        'metrics': {
+            'rmse': rmse,
+            'mae': mae,
+            'pearson_r': pearson_r,
+            'spearman_r': spearman_r,
+            'target_mean': float(np.mean(all_targets)),
+            'target_std': float(np.std(all_targets)),
+            'num_samples': len(all_targets),
+        },
+    }

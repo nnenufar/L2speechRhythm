@@ -4,7 +4,7 @@ from src import train_utils
 from collections import Counter
 import torch
 
-items = ['envelope']
+items = ['egemaps']
 splits = ['Train', 'Development', 'Test']
 
 print("="*70)
@@ -42,7 +42,7 @@ str_counts = Counter(dataset.labels.values())
 # For regression, just use shuffle=True
 dataloader = DataLoader(dataset, batch_size=32, collate_fn=collateFunc, shuffle=True) #sampler=sampler
 batch = next(iter(dataloader))
-print(dataset[0])
+print(dataset[50])
 
 # Batch class distribution
 batch_labels_int = batch['label']

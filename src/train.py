@@ -516,7 +516,7 @@ def train(config):
             'test_pearson_r': test_metrics['pearson_r'],
             'test_spearman_r': test_metrics['spearman_r'],
             'best_val_loss': best_val_loss,
-            'best_val_pearson_r': best_val_metric,
+            'best_val_spearman_r': best_val_metric,
             'total_epochs': len(train_losses),
             'config': config
         }
@@ -557,7 +557,7 @@ def train(config):
     if wandb_enabled:
         if is_regression:
             wandb.summary['best_val_loss'] = best_val_loss
-            wandb.summary['best_val_pearson_r'] = best_val_metric
+            wandb.summary['best_val_spearman_r'] = best_val_metric
             wandb.summary['test_loss'] = test_metrics['loss']
             wandb.summary['test_rmse'] = test_metrics['rmse']
             wandb.summary['test_mae'] = test_metrics['mae']

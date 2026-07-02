@@ -60,7 +60,7 @@ class RhythmEncoder(nn.Module):
 
         self.layer_norm = nn.LayerNorm(self.embed_dim)
 
-    def forward(self, x):
+    def forward(self, x, return_attention=False):
         if x.dim() == 2:
             x = x.unsqueeze(1)
 
@@ -69,9 +69,12 @@ class RhythmEncoder(nn.Module):
 
         audio_features = self.lstm_encoder(cnn_out)
 
-        embeddings, _ = self.lstm_attn_pool(audio_features, tau=self.attn_tau)
+        embeddings, attn_weights = self.lstm_attn_pool(audio_features, tau=self.attn_tau)
 
         embeddings = self.layer_norm(embeddings)
+
+        if return_attention:
+            return embeddings, attn_weights
         return embeddings
 
 
@@ -110,8 +113,10 @@ class RhythmRegressor(nn.Module):
                     or "cnn_only" (freeze CNN stack, train LSTM + attention pool).
     """
     def __init__(self, pretrained_checkpoint=None, freeze_encoder=True,
-                 hidden_size=32, dropout=0.1, **kwargs):
+                 hidden_size=32, dropout=0.1, main_item='envelope', **kwargs):
         super().__init__()
+
+        self.main_item = main_item
 
         encoder_params = inspect.signature(RhythmEncoder.__init__).parameters.keys()
         encoder_kwargs = {k: v for k, v in kwargs.items() if k in encoder_params}
@@ -142,10 +147,14 @@ class RhythmRegressor(nn.Module):
         )
 
     def forward(self, batch, return_attention=False):
-        emb = self.encoder(batch['envelope'])
+        x = batch[self.main_item]
+        if return_attention:
+            emb, attn = self.encoder(x, return_attention=True)
+        else:
+            emb = self.encoder(x)
         out = self.head(emb).squeeze(-1)
         if return_attention:
-            return out, None
+            return out, attn
         return out
 
 
@@ -158,10 +167,11 @@ class DurationRegressor(nn.Module):
     """
     def __init__(self, num_tokens, phone_embed_dim=64, lstm_hidden_size=64,
                  lstm_num_layers=1, dropout=0.1, hidden_size=32, max_phones=5,
-                 **kwargs):
+                 use_phone_durs_z=False, **kwargs):
         super().__init__()
 
         self.max_phones = max_phones
+        self.use_phone_durs_z = use_phone_durs_z
         input_dim = (phone_embed_dim + 1) * max_phones + 1
         lstm_out = lstm_hidden_size * 2
 
@@ -185,6 +195,9 @@ class DurationRegressor(nn.Module):
             embed_dim=lstm_out, hidden_dim=None, dropout=dropout, mode='sigmoid'
         )
 
+        self.ln_v = nn.LayerNorm(input_dim)
+        self.ln_c = nn.LayerNorm(input_dim)
+
         self.head = MLP(
             in_features=lstm_out * 2, hidden_features=hidden_size,
             out_features=1, num_layers=1, activation='relu',
@@ -202,28 +215,35 @@ class DurationRegressor(nn.Module):
             emb = emb[:, :, :self.max_phones, :]
             phone_durs = phone_durs[:, :, :self.max_phones]
 
+        phone_durs = phone_durs.clamp(-5, 5)
+
         subseg = torch.cat([emb, phone_durs.unsqueeze(-1)], dim=-1)
 
         flat = subseg.reshape(*subseg.shape[:-2], -1)
         return torch.cat([flat, dur.unsqueeze(-1)], dim=-1)
 
     def forward(self, batch, return_attention=False):
-        v_feat = self._embed_intervals(batch['v_phones'], batch['v_phone_durs'], batch['v_dur'])
-        c_feat = self._embed_intervals(batch['c_phones'], batch['c_phone_durs'], batch['c_dur'])
+        v_dur_key = 'v_phone_durs_z' if self.use_phone_durs_z else 'v_phone_durs'
+        c_dur_key = 'c_phone_durs_z' if self.use_phone_durs_z else 'c_phone_durs'
+        v_feat = self._embed_intervals(batch['v_phones'], batch[v_dur_key], batch['v_dur'])
+        c_feat = self._embed_intervals(batch['c_phones'], batch[c_dur_key], batch['c_dur'])
+
+        v_feat = self.ln_v(v_feat)
+        c_feat = self.ln_c(c_feat)
 
         v_lengths = (batch['v_dur'] != 0).sum(dim=1).clamp(min=1)
         c_lengths = (batch['c_dur'] != 0).sum(dim=1).clamp(min=1)
 
         v_lstm = self.lstm_v(v_feat, v_lengths)
-        h_v, _ = self.attn_pool_v(v_lstm)
+        h_v, attn_v = self.attn_pool_v(v_lstm)
 
         c_lstm = self.lstm_c(c_feat, c_lengths)
-        h_c, _ = self.attn_pool_c(c_lstm)
+        h_c, attn_c = self.attn_pool_c(c_lstm)
 
         out = self.head(torch.cat([h_v, h_c], dim=-1)).squeeze(-1)
 
         if return_attention:
-            return out, None
+            return out, {'v': attn_v, 'c': attn_c}
         return out
 
 

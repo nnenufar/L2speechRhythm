@@ -187,9 +187,9 @@ class DatasetLMDB(Dataset):
                  phoneme_mapping=None, vc_features=None, label_column='fluency',
                  env=None):
         possible_splits = ['Train', 'Development', 'Test']
-        possible_items = ['key', 'beats', 'envelope_spectrum', 'feats', 'intervals', 'envelope', 'spectrum_freq_bins', 'dur', 'waveform', 'f0', 'voiced_mask', 'egemaps', 'f0_wavelet',
-                          'v_phones', 'v_plen', 'v_phone_durs', 'v_dur',
-                          'c_phones', 'c_plen', 'c_phone_durs', 'c_dur']
+        possible_items = ['key', 'beats', 'envelope_spectrum', 'envelope_derivative', 'feats', 'intervals', 'envelope', 'spectrum_freq_bins', 'dur', 'waveform', 'f0', 'voiced_mask', 'egemaps', 'f0_wavelet',
+                          'v_phones', 'v_plen', 'v_phone_durs', 'v_phone_durs_z', 'v_dur',
+                          'c_phones', 'c_plen', 'c_phone_durs', 'c_phone_durs_z', 'c_dur']
         assert data_source in set(data_sources), "Invalid data source. Check /data directory for available options."
         assert split in possible_splits, f"Invalid split. Must be one of {possible_splits}"
         assert set(items).issubset(possible_items), f"Invalid items. Must be one of {possible_items}"
@@ -246,8 +246,8 @@ class DatasetLMDB(Dataset):
         key = entry['key']
 
         for item in self.items:
-            if item in ('v_phones', 'v_plen', 'v_phone_durs', 'v_dur',
-                        'c_phones', 'c_plen', 'c_phone_durs', 'c_dur'):
+            if item in ('v_phones', 'v_plen', 'v_phone_durs', 'v_phone_durs_z', 'v_dur',
+                        'c_phones', 'c_plen', 'c_phone_durs', 'c_phone_durs_z', 'c_dur'):
                 continue
             if item == "waveform":
                 result[item] = np.array(entry[item], dtype=np.float32)
@@ -277,8 +277,8 @@ class DatasetLMDB(Dataset):
         result['utterance_id'] = torch.tensor(self.utterance_str2int.get(utterance_id, 0))
 
         vc_items_needed = any(item in self.items for item in (
-            'v_phones', 'v_plen', 'v_phone_durs', 'v_dur',
-            'c_phones', 'c_plen', 'c_phone_durs', 'c_dur'))
+            'v_phones', 'v_plen', 'v_phone_durs', 'v_phone_durs_z', 'v_dur',
+            'c_phones', 'c_plen', 'c_phone_durs', 'c_phone_durs_z', 'c_dur'))
         if vc_items_needed:
             spk_id, utt_id = parse_identifier(key)
             lookup_key = f'{spk_id}_{utt_id}'
@@ -312,12 +312,23 @@ class DatasetLMDB(Dataset):
                         else:
                             result[phone_durs_key] = torch.zeros(0, 0, dtype=torch.float32)
 
+                        phone_durs_z_key = f'{prefix}_phone_durs_z'
+                        if phone_durs_z_key in vc:
+                            phone_durs_z_seqs = vc[phone_durs_z_key]
+                            pdur_z_padded = torch.zeros(len(phone_durs_z_seqs), L_max, dtype=torch.float32)
+                            for i, seq in enumerate(phone_durs_z_seqs):
+                                pdur_z_padded[i, :len(seq)] = torch.tensor(seq, dtype=torch.float32)
+                            result[phone_durs_z_key] = pdur_z_padded
+                        else:
+                            result[phone_durs_z_key] = torch.zeros(0, 0, dtype=torch.float32)
+
                     result[f'{prefix}_dur'] = torch.tensor(vc[f'{prefix}_dur'], dtype=torch.float32)
             else:
                 for prefix in ('v', 'c'):
                     result[f'{prefix}_phones'] = torch.zeros(0, 0, dtype=torch.long)
                     result[f'{prefix}_plen'] = torch.zeros(0, dtype=torch.long)
                     result[f'{prefix}_phone_durs'] = torch.zeros(0, 0, dtype=torch.float32)
+                    result[f'{prefix}_phone_durs_z'] = torch.zeros(0, 0, dtype=torch.float32)
                     result[f'{prefix}_dur'] = torch.zeros(0, dtype=torch.float32)
 
         return result

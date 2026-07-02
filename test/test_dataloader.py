@@ -4,7 +4,7 @@ from src import train_utils
 from collections import Counter
 import torch
 
-items = ['egemaps']
+items = ['envelope_derivative']
 splits = ['Train', 'Development', 'Test']
 
 print("="*70)

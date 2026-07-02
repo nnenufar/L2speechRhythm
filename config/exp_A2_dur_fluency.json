@@ -10,12 +10,14 @@
     "lstm_bidirectional": true,
     "dropout": 0.2,
     "hidden_size": 32,
-    "task": "regression"
+    "task": "regression",
+     "use_phone_durs_z": false
   },
   "dataset_params": {
     "lmdb_path": "data/speechocean/rtm_feats.lmdb",
     "data_source": "speechocean_custom",
-    "items": ["v_phones", "v_plen", "v_phone_durs", "v_dur", "c_phones", "c_plen", "c_phone_durs", "c_dur"],
+    "items": ["v_phones", "v_plen", "v_phone_durs", "v_phone_durs_z", "v_dur",
+             "c_phones", "c_plen", "c_phone_durs", "c_phone_durs_z", "c_dur"],
     "test_size": 0.2,
     "vc_features_path": "data/speechocean/vc_features.json",
     "label_column": "fluency"

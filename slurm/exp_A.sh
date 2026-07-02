@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=A2
+#SBATCH --job-name=A2_z
 #SBATCH --output=/home/joao.lima/experiments/rhythm_classifier/slurm/out/rhythm_reg_%j.out
 #SBATCH --error=/home/joao.lima/experiments/rhythm_classifier/slurm/out/rhythm_reg_%j.err
 #SBATCH --ntasks=8
@@ -14,5 +14,5 @@ export TRANSFORMERS_OFFLINE=1
 source ~/miniconda3/bin/activate
 conda activate rtm
 
-python -m src.train --config config/exp_A1c_env_prosody_expand.json
+python -m src.train --config config/exp_A2_dur_prosody.json
 

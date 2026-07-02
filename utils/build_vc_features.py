@@ -3,23 +3,27 @@ Build phone vocabulary and tokenized V/C features from MFA alignments.
 
 Vocab contains individual phones only. Each interval stores a list of phone IDs.
 
-Input:  data/speechocean/vc_alignments.json
-Output: data/speechocean/vc_features.json
-
 Usage:
-    python utils/build_vc_features.py
+    python utils/build_vc_features.py \
+        --input data/speechocean/vc_alignments.json \
+        --output data/speechocean/vc_features.json
 """
 
+import argparse
 import json
 from pathlib import Path
 
 
-INPUT_PATH = Path('data/speechocean/vc_alignments.json')
-OUTPUT_PATH = Path('data/speechocean/vc_features.json')
-
-
 def main():
-    with open(INPUT_PATH, 'r') as f:
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--input', type=str, default='data/speechocean/vc_alignments.json')
+    parser.add_argument('--output', type=str, default='data/speechocean/vc_features.json')
+    args = parser.parse_args()
+
+    input_path = Path(args.input)
+    output_path = Path(args.output)
+
+    with open(input_path, 'r') as f:
         alignments = json.load(f)
 
     all_phones = set()
@@ -47,11 +51,11 @@ def main():
             'c_dur': data['intervocalic']['durations'],
         }
 
-    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(OUTPUT_PATH, 'w') as f:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, 'w') as f:
         json.dump({'vocab': vocab, 'samples': result}, f)
 
-    print(f"Vocab size: {len(vocab)}, saved to {OUTPUT_PATH}")
+    print(f"Vocab size: {len(vocab)}, saved to {output_path}")
 
 
 if __name__ == '__main__':

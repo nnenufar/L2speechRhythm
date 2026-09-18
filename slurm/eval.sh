@@ -4,7 +4,7 @@
 #SBATCH --error=/home/joao.lima/experiments/rhythm_classifier/slurm/out/rhythm_eval.err
 #SBATCH --ntasks=8
 #SBATCH --gres=gpu:1
-#SBATCH --partition=l40s,a5000,p5000,rtx8000,rtx5000
+#SBATCH --partition=l40s,a5000,rtx8000,rtx5000
 #SBATCH --time=00:30:00
 #SBATCH --mem=15G
 
@@ -14,9 +14,9 @@ export TRANSFORMERS_OFFLINE=1
 source ~/miniconda3/bin/activate
 conda activate rtm
 
-CHECKPOINT="exp/exp_A1c_env_fluency_expand/checkpoints/20260608_1414/best_model_epoch316.pth"
+CHECKPOINT="/home/joao.lima/experiments/rhythm_classifier/exp/envRate_prosody_lstm_bi/checkpoints/20260916_1249/best_model_epoch85.pth"
 
 python -m src.eval_regression \
-    --config config/exp_A1c_env_fluency_expand.json \
+    --config /home/joao.lima/experiments/rhythm_classifier/config/consolidate/envRate_prosody_lstm_bi.json \
     --checkpoint "$CHECKPOINT" \
     --split Test

@@ -203,4 +203,9 @@ def resolve_key(utt_id, spk_id='SPEAKER0001'):
 def get_envelope_downsample_factor(model_params):
     stride = model_params.get('cnn_stride', 1)
     num_layers = model_params.get('num_cnn_layers', 3)
+    if isinstance(stride, (list, tuple)):
+        factor = 1
+        for s in stride:
+            factor *= s
+        return factor
     return stride ** num_layers

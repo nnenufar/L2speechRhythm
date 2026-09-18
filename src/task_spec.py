@@ -25,7 +25,7 @@ class TaskSpec:
     best_metric_label: str
     higher_is_better: bool
     checkpoint_metric_keys: Tuple[str, str]
-    test_lines: Callable[[Dict[str, float]], Tuple[str, ...]]
+    dev_lines: Callable[[Dict[str, float]], Tuple[str, ...]]
 
 
 def _prepare_labels_classification(batch):
@@ -116,21 +116,21 @@ def _regression_summary(metrics):
     )
 
 
-def _classification_test_lines(metrics):
+def _classification_dev_lines(metrics):
     return (
-        f"Test Loss: {metrics['loss']:.4f}",
-        f"Test Accuracy: {metrics['accuracy']:.2f}%",
-        f"Test F1: {metrics['f1']:.4f}",
+        f"Dev Loss: {metrics['loss']:.4f}",
+        f"Dev Accuracy: {metrics['accuracy']:.2f}%",
+        f"Dev F1: {metrics['f1']:.4f}",
     )
 
 
-def _regression_test_lines(metrics):
+def _regression_dev_lines(metrics):
     return (
-        f"Test Loss: {metrics['loss']:.4f}",
-        f"Test RMSE: {metrics['rmse']:.4f}",
-        f"Test MAE: {metrics['mae']:.4f}",
-        f"Test Pearson r: {metrics['pearson_r']:.4f}",
-        f"Test Spearman r: {metrics['spearman_r']:.4f}",
+        f"Dev Loss: {metrics['loss']:.4f}",
+        f"Dev RMSE: {metrics['rmse']:.4f}",
+        f"Dev MAE: {metrics['mae']:.4f}",
+        f"Dev Pearson r: {metrics['pearson_r']:.4f}",
+        f"Dev Spearman r: {metrics['spearman_r']:.4f}",
     )
 
 
@@ -150,7 +150,7 @@ def get_task_spec(task):
             best_metric_label='Spearman r',
             higher_is_better=True,
             checkpoint_metric_keys=('train_rmse', 'val_rmse'),
-            test_lines=_regression_test_lines,
+            dev_lines=_regression_dev_lines,
         )
 
     return TaskSpec(
@@ -167,5 +167,5 @@ def get_task_spec(task):
         best_metric_label='F1',
         higher_is_better=True,
         checkpoint_metric_keys=('train_accuracy', 'val_accuracy'),
-        test_lines=_classification_test_lines,
+        dev_lines=_classification_dev_lines,
     )

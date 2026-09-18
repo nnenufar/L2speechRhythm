@@ -2,7 +2,7 @@ Speech rhythm analysis tools
 
 # Code purpose and functionalities
 
-This repository contains code associated with the Master's project titled "Enhancing duration prediction in deep learning TTS models from a psychoacoustic perspective of speech rhythm". The ``vowel_beat_detector`` submodule provides rhythmic feature extraction tools (check the submodule's README.md for more details). The source code at root provides deep learning resources to process these features and perform feature learning and classification tasks.
+The ``vowel_beat_detector`` submodule provides rhythmic feature extraction tools (check the submodule's README.md for more details). The source code at root provides deep learning resources to process these features and perform feature learning and classification tasks.
 
 # Quick start
 
@@ -185,8 +185,8 @@ All results land under `exp/<exp_name>/` with the following structure:
 |---|---|
 | `checkpoints/<timestamp>/` | Best-model checkpoints (`best_model_epochN.pth`) |
 | `plots/` | Training curves (loss, RMSE, Pearson r) |
-| `test_results/<timestamp>/` | `test_results_<timestamp>.json` with final test metrics |
-| `eval/` | Per-sample predictions CSV + summary JSON (generated at test time) |
+| `dev_results/<timestamp>/` | `dev_results_<timestamp>.json` with final dev metrics |
+| `eval/` | Per-sample predictions CSV + summary JSON (generated at dev time) |
 
 Each checkpoint contains model weights, optimizer state, and the `utterance_str2int` mapping needed for inference.
 

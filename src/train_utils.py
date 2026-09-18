@@ -15,8 +15,8 @@ def setup_experiment_dir(exp_name, timestamp=None):
         timestamp: Optional timestamp string for subdirectories
     
     Returns:
-        dict with keys: exp_dir, logs_dir, plots_dir, checkpoints_dir, 
-                        att_plots_dir, test_results_dir
+        dict with keys: exp_dir, logs_dir, plots_dir, checkpoints_dir,
+                        att_plots_dir, dev_results_dir
     """
     exp_dir = Path("exp") / exp_name
     logs_dir = exp_dir / "logs"
@@ -27,14 +27,14 @@ def setup_experiment_dir(exp_name, timestamp=None):
         timestamp = datetime.now().strftime('%Y%m%d_%H%M')
     checkpoints_dir = exp_dir / "checkpoints" / timestamp
     att_plots_dir = exp_dir / "att_plots" / timestamp
-    test_results_dir = exp_dir / "test_results" / timestamp
+    dev_results_dir = exp_dir / "dev_results" / timestamp
     
     # Create directories
     logs_dir.mkdir(parents=True, exist_ok=True)
     plots_dir.mkdir(parents=True, exist_ok=True)
     checkpoints_dir.mkdir(parents=True, exist_ok=True)
     att_plots_dir.mkdir(parents=True, exist_ok=True)
-    test_results_dir.mkdir(parents=True, exist_ok=True)
+    dev_results_dir.mkdir(parents=True, exist_ok=True)
     
     return {
         'exp_dir': exp_dir,
@@ -42,7 +42,7 @@ def setup_experiment_dir(exp_name, timestamp=None):
         'plots_dir': plots_dir,
         'checkpoints_dir': checkpoints_dir,
         'att_plots_dir': att_plots_dir,
-        'test_results_dir': test_results_dir
+        'dev_results_dir': dev_results_dir
     }
 
 def setup_logger(logs_dir, exp_name, log_to_file=True):

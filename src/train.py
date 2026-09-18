@@ -15,7 +15,7 @@ from src.train_utils import (
     plot_attention_weights, plot_attention_summary,
     plot_regression_curves
 )
-from src.dataloaders import DatasetLMDB, collate_fn, processor_ssl
+from src.dataloaders import DatasetLMDB, DatasetRhythmFeatures, collate_fn, processor_ssl
 from src.evaluation import collect_regression_predictions
 from torch.utils.data import DataLoader
 
@@ -27,6 +27,7 @@ MODEL_MAPPING = {
     "ssl": models.WAV_LM,
     "rhythm_regressor": models.RhythmRegressor,
     "duration_regressor": models.DurationRegressor,
+    "rhythm_feature_mlp": models.RhythmFeatureMLP,
 }
 
 COLLATE_FUNC_MAPPING = {
@@ -60,7 +61,7 @@ def to_wandb_metrics(metrics):
             wandb_metrics[f"val/{key[4:]}"] = value
     return wandb_metrics
 
-def train(config):
+def train(config, trial=None, save_ckpt=False):
     # Setup experiment directories
     exp_name = config.get('exp_name')
     dirs = setup_experiment_dir(exp_name, timestamp)
@@ -69,7 +70,7 @@ def train(config):
     plots_dir = dirs['plots_dir']
     checkpoints_dir = dirs['checkpoints_dir']
     att_plots_dir = dirs['att_plots_dir']
-    test_results_dir = dirs['test_results_dir']
+    dev_results_dir = dirs['dev_results_dir']
     
     # Setup logger (console only; metrics go to wandb)
     logger = setup_logger(logs_dir, exp_name, log_to_file=False)
@@ -135,9 +136,14 @@ def train(config):
         dataset_params['target_std'] = target_std
         logger.info(f"Target normalization: mean={target_mean}, std={target_std}")
     
-    lmdb_env = lmdb.open(dataset_params['lmdb_path'], readonly=True, lock=False, readahead=False, meminit=False)
+    is_rhythm_feature_mlp = config.get('model_type') == 'rhythm_feature_mlp'
 
-    train_dataset = DatasetLMDB(**dataset_params, split='Train', vc_features=vc_features, env=lmdb_env)
+    lmdb_env = None
+    if is_rhythm_feature_mlp:
+        train_dataset = DatasetRhythmFeatures(**dataset_params, split='Train')
+    else:
+        lmdb_env = lmdb.open(dataset_params['lmdb_path'], readonly=True, lock=False, readahead=False, meminit=False)
+        train_dataset = DatasetLMDB(**dataset_params, split='Train', vc_features=vc_features, env=lmdb_env)
 
     utterance_embed_dim = config['model_params'].get('utterance_embed_dim', 0)
     train_utterance_str2int = None
@@ -148,14 +154,26 @@ def train(config):
         logger.info(f"Using utterance ID embeddings: dim={utterance_embed_dim}, "
                     f"num_utterances={len(train_utterance_str2int)}")
 
-    dev_dataset = DatasetLMDB(**dataset_params, split='Development',
-                              external_utterance_str2int=train_utterance_str2int,
-                              external_utterance_int2str=train_utterance_int2str,
-                              vc_features=vc_features, env=lmdb_env)
-    test_dataset = DatasetLMDB(**dataset_params, split='Test',
-                               external_utterance_str2int=train_utterance_str2int,
-                               external_utterance_int2str=train_utterance_int2str,
-                               vc_features=vc_features, env=lmdb_env)
+    if is_rhythm_feature_mlp:
+        dev_dataset = DatasetRhythmFeatures(**dataset_params, split='Development',
+                                            external_utterance_str2int=train_utterance_str2int,
+                                            external_utterance_int2str=train_utterance_int2str,
+                                            external_feature_mean=train_dataset.feature_mean,
+                                            external_feature_std=train_dataset.feature_std)
+        test_dataset = DatasetRhythmFeatures(**dataset_params, split='Test',
+                                             external_utterance_str2int=train_utterance_str2int,
+                                             external_utterance_int2str=train_utterance_int2str,
+                                             external_feature_mean=train_dataset.feature_mean,
+                                             external_feature_std=train_dataset.feature_std)
+    else:
+        dev_dataset = DatasetLMDB(**dataset_params, split='Development',
+                                  external_utterance_str2int=train_utterance_str2int,
+                                  external_utterance_int2str=train_utterance_int2str,
+                                  vc_features=vc_features, env=lmdb_env)
+        test_dataset = DatasetLMDB(**dataset_params, split='Test',
+                                   external_utterance_str2int=train_utterance_str2int,
+                                   external_utterance_int2str=train_utterance_int2str,
+                                   vc_features=vc_features, env=lmdb_env)
 
     # Compute class/label distribution on train
     from collections import Counter
@@ -331,6 +349,19 @@ def train(config):
 
         # Check if best model
         current_val_metric = epoch_metrics[task_spec.best_metric_key]
+
+        # Report to Optuna and prune underperforming trials early
+        if trial is not None:
+            value = float(current_val_metric)
+            if np.isfinite(value):
+                trial.report(value, step=epoch)
+                if trial.should_prune():
+                    logger.info(f"Trial pruned at epoch {epoch+1}")
+                    if lmdb_env is not None:
+                        lmdb_env.close()
+                    import optuna
+                    raise optuna.exceptions.TrialPruned()
+
         if task_spec.higher_is_better:
             is_improved = current_val_metric > best_val_metric
         else:
@@ -408,7 +439,7 @@ def train(config):
                 model.train()
         
         # Save periodic checkpoint
-        if args.save_ckpt and (epoch + 1) % save_every == 0:
+        if save_ckpt and (epoch + 1) % save_every == 0:
             train_metric_key, val_metric_key = task_spec.checkpoint_metric_keys
             save_checkpoint(
                 model, optimizer, epoch+1, avg_train_loss, epoch_metrics[train_metric_key],
@@ -441,9 +472,9 @@ def train(config):
         utterance_str2int=train_utterance_str2int
     )
     
-    # Final evaluation on test set
+    # Final evaluation on dev set
     logger.info("\n" + "="*70)
-    logger.info("Evaluating on test set...")
+    logger.info("Evaluating on dev set...")
 
     checkpoint_epoch = None
     if best_model_path is not None and best_model_path.exists():
@@ -456,12 +487,12 @@ def train(config):
         logger.info("No best model checkpoint found; evaluating with current model")
 
     if is_regression:
-        results = collect_regression_predictions(model, test_loader, device)
+        results = collect_regression_predictions(model, dev_loader, device)
         all_targets = results['targets']
         all_preds = results['preds']
         m = results['metrics']
 
-        test_metrics = {
+        dev_metrics = {
             'loss': float('nan'),
             'rmse': m['rmse'],
             'mae': m['mae'],
@@ -477,13 +508,13 @@ def train(config):
             'ground_truth': all_targets,
             'prediction': all_preds,
         })
-        csv_path = eval_dir / f'predictions_Test_{timestamp}.csv'
+        csv_path = eval_dir / f'predictions_Dev_{timestamp}.csv'
         df.to_csv(csv_path, index=False)
         logger.info(f"Predictions saved to {csv_path}")
 
         summary = {
             'exp_name': exp_name,
-            'split': 'Test',
+            'split': 'Dev',
             'num_samples': m['num_samples'],
             'rmse': m['rmse'],
             'mae': m['mae'],
@@ -493,64 +524,64 @@ def train(config):
             'target_mean': m['target_mean'],
             'target_std': m['target_std'],
         }
-        summary_path = eval_dir / f'summary_Test_{timestamp}.json'
+        summary_path = eval_dir / f'summary_Dev_{timestamp}.json'
         with open(summary_path, 'w') as f:
             json.dump(summary, f, indent=2)
         logger.info(f"Summary saved to {summary_path}")
 
     else:
-        test_metrics = task_spec.eval_metrics(
-            model, test_loader, criterion, device, target_mean, target_std
+        dev_metrics = task_spec.eval_metrics(
+            model, dev_loader, criterion, device, target_mean, target_std
         )
 
-    for line in task_spec.test_lines(test_metrics):
+    for line in task_spec.dev_lines(dev_metrics):
         logger.info(line)
 
     if is_regression:
-        test_results = {
+        dev_results = {
             'exp_name': exp_name,
             'timestamp': timestamp,
             'task': 'regression',
-            'test_rmse': test_metrics['rmse'],
-            'test_mae': test_metrics['mae'],
-            'test_pearson_r': test_metrics['pearson_r'],
-            'test_spearman_r': test_metrics['spearman_r'],
+            'dev_rmse': dev_metrics['rmse'],
+            'dev_mae': dev_metrics['mae'],
+            'dev_pearson_r': dev_metrics['pearson_r'],
+            'dev_spearman_r': dev_metrics['spearman_r'],
             'best_val_loss': best_val_loss,
             'best_val_spearman_r': best_val_metric,
             'total_epochs': len(train_losses),
             'config': config
         }
     else:
-        test_results = {
+        dev_results = {
             'exp_name': exp_name,
             'timestamp': timestamp,
             'task': 'classification',
-            'test_loss': test_metrics['loss'],
-            'test_accuracy': test_metrics['accuracy'],
-            'test_f1': test_metrics['f1'],
+            'dev_loss': dev_metrics['loss'],
+            'dev_accuracy': dev_metrics['accuracy'],
+            'dev_f1': dev_metrics['f1'],
             'best_val_loss': best_val_loss,
             'best_val_f1': best_val_metric,
             'total_epochs': len(train_losses),
             'config': config
         }
 
-    test_results_file = test_results_dir / f'test_results_{timestamp}.json'
-    with open(test_results_file, 'w') as f:
-        json.dump(test_results, f, indent=2)
-    logger.info(f"Test results saved to {test_results_file}")
+    dev_results_file = dev_results_dir / f'dev_results_{timestamp}.json'
+    with open(dev_results_file, 'w') as f:
+        json.dump(dev_results, f, indent=2)
+    logger.info(f"Dev results saved to {dev_results_file}")
     
     logger.info("\n" + "="*70)
     logger.info("Training completed successfully!")
     logger.info(f"  Best validation loss: {best_val_loss:.4f}")
     if is_regression:
         logger.info(f"  Best validation {task_spec.best_metric_label}: {best_val_metric:.4f}")
-        logger.info(f"  Final test RMSE: {test_metrics['rmse']:.4f}")
-        logger.info(f"  Final test Pearson r: {test_metrics['pearson_r']:.4f}")
+        logger.info(f"  Final dev RMSE: {dev_metrics['rmse']:.4f}")
+        logger.info(f"  Final dev Pearson r: {dev_metrics['pearson_r']:.4f}")
     else:
         logger.info(f"  Best validation {task_spec.best_metric_label}: {best_val_metric:.4f}")
-        logger.info(f"  Final test loss: {test_metrics['loss']:.4f}")
-        logger.info(f"  Final test accuracy: {test_metrics['accuracy']:.2f}%")
-        logger.info(f"  Final test F1: {test_metrics['f1']:.4f}")
+        logger.info(f"  Final dev loss: {dev_metrics['loss']:.4f}")
+        logger.info(f"  Final dev accuracy: {dev_metrics['accuracy']:.2f}%")
+        logger.info(f"  Final dev F1: {dev_metrics['f1']:.4f}")
     logger.info(f"  Experiment directory: {exp_dir}")
     logger.info("="*70)
 
@@ -558,20 +589,23 @@ def train(config):
         if is_regression:
             wandb.summary['best_val_loss'] = best_val_loss
             wandb.summary['best_val_spearman_r'] = best_val_metric
-            wandb.summary['test_loss'] = test_metrics['loss']
-            wandb.summary['test_rmse'] = test_metrics['rmse']
-            wandb.summary['test_mae'] = test_metrics['mae']
-            wandb.summary['test_pearson_r'] = test_metrics['pearson_r']
-            wandb.summary['test_spearman_r'] = test_metrics['spearman_r']
+            wandb.summary['dev_loss'] = dev_metrics['loss']
+            wandb.summary['dev_rmse'] = dev_metrics['rmse']
+            wandb.summary['dev_mae'] = dev_metrics['mae']
+            wandb.summary['dev_pearson_r'] = dev_metrics['pearson_r']
+            wandb.summary['dev_spearman_r'] = dev_metrics['spearman_r']
         else:
             wandb.summary['best_val_loss'] = best_val_loss
             wandb.summary['best_val_f1'] = best_val_metric
-            wandb.summary['test_loss'] = test_metrics['loss']
-            wandb.summary['test_accuracy'] = test_metrics['accuracy']
-            wandb.summary['test_f1'] = test_metrics['f1']
+            wandb.summary['dev_loss'] = dev_metrics['loss']
+            wandb.summary['dev_accuracy'] = dev_metrics['accuracy']
+            wandb.summary['dev_f1'] = dev_metrics['f1']
         wandb.finish()
 
-    lmdb_env.close()
+    if lmdb_env is not None:
+        lmdb_env.close()
+
+    return best_val_metric
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train a sequence classification model.")
@@ -584,4 +618,4 @@ if __name__ == "__main__":
     with open(args.config, 'r') as f:
         config = json.load(f)
     
-    train(config)
+    train(config, save_ckpt=args.save_ckpt)

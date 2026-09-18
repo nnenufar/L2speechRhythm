@@ -334,6 +334,95 @@ class DatasetLMDB(Dataset):
         return result
 
 
+class DatasetRhythmFeatures(Dataset):
+    """
+    Dataset of per-utterance scalar rhythm-metric features (nPVI / rPVI / delta).
+
+    Reads a CSV of precomputed features and reuses ``get_labels_for_source`` so the
+    train/dev/test identifier sets are identical to the other Speechocean baselines.
+    Features are z-scored using stats fit on the train split only (dev/test receive the
+    train stats via ``external_feature_mean``/``external_feature_std``).
+    """
+    DEFAULT_FEATURE_COLS = ['npvi_v', 'npvi_c', 'rpvi_v', 'rpvi_c', 'delta_v', 'delta_c']
+
+    def __init__(self, rhythm_features_path, data_source, split, test_size=0.2,
+                 random_seed=42, label_column='fluency', feature_cols=None,
+                 target_mean=None, target_std=None,
+                 external_feature_mean=None, external_feature_std=None,
+                 external_utterance_str2int=None, external_utterance_int2str=None):
+        possible_splits = ['Train', 'Development', 'Test']
+        assert data_source in set(data_sources), "Invalid data source."
+        assert split in possible_splits, f"Invalid split. Must be one of {possible_splits}"
+
+        self.feature_cols = feature_cols or self.DEFAULT_FEATURE_COLS
+        self.split = split
+        self.target_mean = target_mean
+        self.target_std = target_std
+
+        df = pd.read_csv(rhythm_features_path)
+        self.features = {
+            row['identifier']: row[self.feature_cols].to_numpy(dtype=np.float32)
+            for _, row in df.iterrows()
+        }
+
+        # Same label source as DatasetLMDB -> identical splits.
+        self.labels = get_labels_for_source(data_source, split, test_size, random_seed,
+                                            label_column=label_column)
+        self.keys = [identifier for identifier in self.labels if identifier in self.features]
+
+        self.labels_map = process_labels(list(self.labels.values()))
+        self.labels_str2int = self.labels_map[0]
+        self.labels_int2str = self.labels_map[1]
+
+        identifiers = self.keys
+        if external_utterance_str2int is not None and external_utterance_int2str is not None:
+            self.utterance_str2int = external_utterance_str2int
+            self.utterance_int2str = external_utterance_int2str
+        else:
+            _, _, utterance_str2int, utterance_int2str = process_identifiers(identifiers)
+            self.utterance_str2int = utterance_str2int
+            self.utterance_int2str = utterance_int2str
+
+        speaker_ids = [parse_identifier(identifier)[0] for identifier in identifiers]
+        unique_speakers = sorted(set(speaker_ids))
+        self.speaker_str2int = {spk: i for i, spk in enumerate(unique_speakers)}
+        self.speaker_int2str = {i: spk for spk, i in self.speaker_str2int.items()}
+
+        if external_feature_mean is not None and external_feature_std is not None:
+            self.feature_mean = np.asarray(external_feature_mean, dtype=np.float32)
+            self.feature_std = np.asarray(external_feature_std, dtype=np.float32)
+        else:
+            feature_matrix = np.stack([self.features[k] for k in self.keys])
+            self.feature_mean = feature_matrix.mean(axis=0)
+            self.feature_std = feature_matrix.std(axis=0)
+
+    def __len__(self):
+        return len(self.keys)
+
+    def __getitem__(self, idx):
+        identifier = self.keys[idx]
+
+        x = self.features[identifier]
+        x = (x - self.feature_mean) / (self.feature_std + 1e-8)
+        result = {'features': torch.tensor(x, dtype=torch.float32)}
+
+        label = self.labels_str2int.get(self.labels[identifier])
+        if self.target_mean is not None and self.target_std is not None:
+            label = (float(label) - self.target_mean) / self.target_std
+            result['label'] = torch.tensor(label, dtype=torch.float32)
+        elif isinstance(label, float):
+            result['label'] = torch.tensor(label, dtype=torch.float32)
+        else:
+            result['label'] = torch.tensor(label, dtype=torch.long)
+
+        speaker_id, utterance_id = parse_identifier(identifier)
+        result['identifier'] = identifier
+        result['speaker_id'] = torch.tensor(self.speaker_str2int[speaker_id])
+        result['utterance_id'] = torch.tensor(self.utterance_str2int.get(utterance_id, 0))
+
+        return result
+
+
 class ContrastiveBatchSampler(Sampler):
     """
     Batch sampler for contrastive pretraining of the rhythm encoder.

@@ -67,19 +67,21 @@ class Conv1dBlock(nn.Module):
     A 1D convolutional layer followed by optional normalization, activation, and dropout.
     """
     def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding='same',
-                 activation='relu', dropout=0.0, norm=None):
+                 dilation=1, activation='relu', dropout=0.0, norm=None):
         super(Conv1dBlock, self).__init__()
-        
+
         # Handle padding for strided convolutions
+        effective_kernel = (kernel_size - 1) * dilation + 1
         if stride > 1:
             # For strided conv, 'same' padding isn't straightforward
-            # Use manual padding to maintain expected downsampling
-            padding_val = kernel_size // 2
-            self.conv = nn.Conv1d(in_channels, out_channels, kernel_size, 
-                                  stride=stride, padding=padding_val)
+            # Use manual padding to maintain expected downsampling (generalized for dilation)
+            padding_val = effective_kernel // 2
+            self.conv = nn.Conv1d(in_channels, out_channels, kernel_size,
+                                  stride=stride, padding=padding_val, dilation=dilation)
         else:
-            self.conv = nn.Conv1d(in_channels, out_channels, kernel_size, 
-                                  stride=stride, padding=padding)
+            # PyTorch's 'same' padding already accounts for dilation when stride == 1
+            self.conv = nn.Conv1d(in_channels, out_channels, kernel_size,
+                                  stride=stride, padding=padding, dilation=dilation)
         
         self.norm = None
         if norm == 'batch':
@@ -125,29 +127,216 @@ class Conv1dStack(nn.Module):
     """
     A stack of 1D convolutional blocks.
     """
-    def __init__(self, in_channels, hidden_channels, out_channels, kernel_size, 
-                 num_layers=2, activation='relu', dropout=0.0, norm='batch', stride=1):
+    def __init__(self, in_channels, hidden_channels, out_channels, kernel_size,
+                 num_layers=2, activation='relu', dropout=0.0, norm='batch',
+                 stride=1, dilation=1):
         super(Conv1dStack, self).__init__()
         layers = []
-        
+
+        # Normalize stride to a per-layer tuple; dilations double each layer (1, 2, 4, ...)
+        strides = self._broadcast(stride, num_layers)
+        dilations = [dilation * (2 ** i) for i in range(num_layers)]
+
         # First layer (with stride for downsampling if specified)
-        layers.append(Conv1dBlock(in_channels, hidden_channels, kernel_size, 
-                                   stride=stride, activation=activation, dropout=dropout, norm=norm))
-        
+        layers.append(Conv1dBlock(in_channels, hidden_channels, kernel_size,
+                                   stride=strides[0], dilation=dilations[0],
+                                   activation=activation, dropout=dropout, norm=norm))
+
         # Hidden layers (can also use stride for progressive downsampling)
-        for _ in range(num_layers - 2):
+        for i in range(1, num_layers - 1):
             layers.append(Conv1dBlock(hidden_channels, hidden_channels, kernel_size,
-                                       stride=stride, activation=activation, dropout=dropout, norm=norm))
-        
+                                       stride=strides[i], dilation=dilations[i],
+                                       activation=activation, dropout=dropout, norm=norm))
+
         # Output layer
         if num_layers > 1:
             layers.append(Conv1dBlock(hidden_channels, out_channels, kernel_size,
-                                       stride=stride, activation=activation, dropout=dropout, norm=norm))
-        
+                                       stride=strides[-1], dilation=dilations[-1],
+                                       activation=activation, dropout=dropout, norm=norm))
+
         self.stack = nn.Sequential(*layers)
-    
+
+    @staticmethod
+    def _broadcast(stride, num_layers):
+        if isinstance(stride, int):
+            return (stride,) * num_layers
+        s = tuple(stride)
+        if len(s) != num_layers:
+            raise ValueError(f"stride tuple length {len(s)} != num_layers {num_layers}")
+        return s
+
     def forward(self, x):
         return self.stack(x)
+
+
+class InceptionTimeBlock(nn.Module):
+    """
+    InceptionTime-style 1D block with parallel convolutions at multiple time scales.
+
+    The block keeps a 1x1 bottleneck before the parallel kernel branches and uses a
+    stride-1 max-pool branch. When ``stride > 1``, the concatenated block output is
+    downsampled after activation so all branches remain aligned.
+    """
+    def __init__(self, input_size, filters, kernel_sizes=(10, 20, 40), stride=1,
+                 norm='batch'):
+        super().__init__()
+        if len(kernel_sizes) != 3:
+            raise ValueError("kernel_sizes must contain exactly three kernel sizes")
+        if norm not in ('batch', 'layer'):
+            raise ValueError("norm must be 'batch' or 'layer'")
+        self.norm = norm
+
+        self.bottleneck1 = nn.Conv1d(
+            in_channels=input_size,
+            out_channels=filters,
+            kernel_size=1,
+            stride=1,
+            padding='same',
+            bias=False,
+        )
+
+        self.convs = nn.ModuleList([
+            nn.Conv1d(
+                in_channels=filters,
+                out_channels=filters,
+                kernel_size=kernel_size,
+                stride=1,
+                padding='same',
+                bias=False,
+            )
+            for kernel_size in kernel_sizes
+        ])
+
+        self.max_pool = nn.MaxPool1d(kernel_size=3, stride=1, padding=1)
+
+        self.bottleneck2 = nn.Conv1d(
+            in_channels=input_size,
+            out_channels=filters,
+            kernel_size=1,
+            stride=1,
+            padding='same',
+            bias=False,
+        )
+
+        if norm == 'layer':
+            self.block_norm = nn.LayerNorm(4 * filters)
+        else:
+            self.block_norm = nn.BatchNorm1d(num_features=4 * filters)
+        self.downsample = (
+            nn.AvgPool1d(kernel_size=stride, stride=stride, ceil_mode=True)
+            if stride > 1 else nn.Identity()
+        )
+
+    def forward(self, x):
+        x0 = self.bottleneck1(x)
+        branch_outputs = [conv(x0) for conv in self.convs]
+        branch_outputs.append(self.bottleneck2(self.max_pool(x)))
+
+        y = torch.cat(branch_outputs, dim=1)
+        if self.norm == 'layer':
+            y = self.block_norm(y.transpose(1, 2)).transpose(1, 2)
+        else:
+            y = self.block_norm(y)
+        y = F.relu(y)
+        y = self.downsample(y)
+        return y
+
+
+class InceptionTimeResidual(nn.Module):
+    """
+    Residual connection for an InceptionTime stack. A 1x1 projection handles channel
+    expansion, and a small temporal pool aligns the residual input when the stack
+    uses ``stride > 1``.
+    """
+    def __init__(self, input_size, out_channels, stride=1, norm='batch'):
+        super().__init__()
+        if norm not in ('batch', 'layer'):
+            raise ValueError("norm must be 'batch' or 'layer'")
+        self.norm = norm
+        self.downsample = (
+            nn.AvgPool1d(kernel_size=stride, stride=stride, ceil_mode=True)
+            if stride > 1 else nn.Identity()
+        )
+        self.bottleneck = nn.Conv1d(
+            in_channels=input_size,
+            out_channels=out_channels,
+            kernel_size=1,
+            stride=1,
+            padding='same',
+            bias=False,
+        )
+        if norm == 'layer':
+            self.block_norm = nn.LayerNorm(out_channels)
+        else:
+            self.block_norm = nn.BatchNorm1d(num_features=out_channels)
+
+    def forward(self, x, y):
+        residual = self.bottleneck(self.downsample(x))
+        if self.norm == 'layer':
+            residual = self.block_norm(residual.transpose(1, 2)).transpose(1, 2)
+        else:
+            residual = self.block_norm(residual)
+        y = y + residual
+        return F.relu(y)
+
+
+class InceptionTimeStack(nn.Module):
+    """
+    Stack of InceptionTime blocks with residual connections after every third block.
+
+    Args:
+        in_channels: Number of input channels.
+        filters: Number of filters per parallel Inception branch. Output channels are
+            ``4 * filters``.
+        num_blocks: Number of Inception blocks.
+        kernel_sizes: Three parallel convolution kernel sizes.
+        stride: Temporal downsampling stride applied once per Inception block.
+    """
+    def __init__(self, in_channels, filters, num_blocks=3,
+                 kernel_sizes=(10, 20, 40), stride=1, norm='batch'):
+        super().__init__()
+        if num_blocks < 1:
+            raise ValueError("num_blocks must be at least 1")
+        if norm not in ('batch', 'layer'):
+            raise ValueError("norm must be 'batch' or 'layer'")
+
+        self.num_blocks = num_blocks
+        self.blocks = nn.ModuleList()
+        self.residuals = nn.ModuleList()
+        self.residual_indices = []
+
+        for d in range(num_blocks):
+            block_input_size = in_channels if d == 0 else 4 * filters
+            self.blocks.append(InceptionTimeBlock(
+                input_size=block_input_size,
+                filters=filters,
+                kernel_sizes=kernel_sizes,
+                stride=stride,
+                norm=norm,
+            ))
+
+            if d % 3 == 2:
+                residual_input_size = in_channels if d == 2 else 4 * filters
+                self.residuals.append(InceptionTimeResidual(
+                    input_size=residual_input_size,
+                    out_channels=4 * filters,
+                    stride=stride ** 3,
+                    norm=norm,
+                ))
+                self.residual_indices.append(d)
+
+    def forward(self, x):
+        residual_iter = iter(zip(self.residual_indices, self.residuals))
+
+        for d in range(self.num_blocks):
+            y = self.blocks[d](x if d == 0 else y)
+
+            if d % 3 == 2:
+                _, residual = next(residual_iter)
+                y = residual(x, y)
+                x = y
+
+        return y
 
 
 class GlobalPooling(nn.Module):
@@ -326,6 +515,150 @@ class LSTMEncoder(nn.Module):
             output = self.dropout(output)
         
         return output
+
+
+# ==============================================================================
+# Relative Positional Encoding Transformer
+# ==============================================================================
+
+class RelativeGlobalAttention(nn.Module):
+    """
+    Multi-head self-attention with relative positional encoding.
+
+    Args:
+        d_model: Model / attention dimension.
+        num_heads: Number of attention heads (must divide ``d_model``).
+        max_len: Maximum sequence length the relative embedding can cover.
+        dropout: Attention dropout rate.
+        causal: If True, each position attends only to itself and earlier
+            positions (lower-triangular mask). Default False (bidirectional).
+    """
+    def __init__(self, d_model, num_heads, max_len=1024, dropout=0.1, causal=False):
+        super().__init__()
+        d_head, remainder = divmod(d_model, num_heads)
+        if remainder:
+            raise ValueError("incompatible `d_model` and `num_heads`")
+        self.max_len = max_len
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.causal = causal
+        self.key = nn.Linear(d_model, d_model)
+        self.value = nn.Linear(d_model, d_model)
+        self.query = nn.Linear(d_model, d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.Er = nn.Parameter(torch.randn(max_len, d_head))
+
+    def forward(self, x, key_padding_mask=None):
+        # x.shape == (batch_size, seq_len, d_model)
+        batch_size, seq_len, _ = x.shape
+
+        if seq_len > self.max_len:
+            raise ValueError("sequence length exceeds model capacity")
+
+        k_t = self.key(x).reshape(batch_size, seq_len, self.num_heads, -1).permute(0, 2, 3, 1)
+        # k_t.shape = (batch_size, num_heads, d_head, seq_len)
+        v = self.value(x).reshape(batch_size, seq_len, self.num_heads, -1).transpose(1, 2)
+        q = self.query(x).reshape(batch_size, seq_len, self.num_heads, -1).transpose(1, 2)
+        # shape = (batch_size, num_heads, seq_len, d_head)
+
+        start = self.max_len - seq_len
+        Er_t = self.Er[start:, :].transpose(0, 1)
+        # Er_t.shape = (d_head, seq_len)
+        QEr = torch.matmul(q, Er_t)
+        # QEr.shape = (batch_size, num_heads, seq_len, seq_len)
+        Srel = self.skew(QEr)
+        # Srel.shape = (batch_size, num_heads, seq_len, seq_len)
+
+        QK_t = torch.matmul(q, k_t)
+        # QK_t.shape = (batch_size, num_heads, seq_len, seq_len)
+        attn = (QK_t + Srel) / math.sqrt(q.size(-1))
+
+        if self.causal:
+            causal_mask = torch.triu(
+                torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool), diagonal=1
+            )
+            attn = attn.masked_fill(causal_mask, float("-inf"))
+        if key_padding_mask is not None:
+            # key_padding_mask: (batch_size, seq_len) with True = pad
+            attn = attn.masked_fill(key_padding_mask.unsqueeze(1).unsqueeze(2), float("-inf"))
+
+        attn = F.softmax(attn, dim=-1)
+        out = torch.matmul(attn, v)
+        # out.shape = (batch_size, num_heads, seq_len, d_head)
+        out = out.transpose(1, 2)
+        # out.shape == (batch_size, seq_len, num_heads, d_head)
+        out = out.reshape(batch_size, seq_len, -1)
+        # out.shape == (batch_size, seq_len, d_model)
+        return self.dropout(out)
+
+    def skew(self, QEr):
+        # QEr.shape = (batch_size, num_heads, seq_len, seq_len)
+        padded = F.pad(QEr, (1, 0))
+        # padded.shape = (batch_size, num_heads, seq_len, 1 + seq_len)
+        batch_size, num_heads, num_rows, num_cols = padded.shape
+        reshaped = padded.reshape(batch_size, num_heads, num_cols, num_rows)
+        # reshaped.size = (batch_size, num_heads, 1 + seq_len, seq_len)
+        Srel = reshaped[:, :, 1:, :]
+        # Srel.shape = (batch_size, num_heads, seq_len, seq_len)
+        return Srel
+
+
+class _RelativeTransformerBlock(nn.Module):
+    """Pre-LayerNorm transformer block: attn -> residual -> FFN -> residual."""
+
+    def __init__(self, d_model, num_heads, ffn_dim, dropout, max_len, causal):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(d_model)
+        self.attn = RelativeGlobalAttention(
+            d_model, num_heads, max_len=max_len, dropout=dropout, causal=causal
+        )
+        self.norm2 = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, ffn_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(ffn_dim, d_model),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x, key_padding_mask=None):
+        x = x + self.attn(self.norm1(x), key_padding_mask)
+        x = x + self.ffn(self.norm2(x))
+        return x
+
+
+class RelativeTransformerEncoder(nn.Module):
+    """
+    Stack of pre-LayerNorm transformer blocks using ``RelativeGlobalAttention``.
+
+    Args:
+        d_model: Model / attention dimension.
+        num_heads: Number of attention heads (must divide ``d_model``).
+        num_layers: Number of stacked blocks.
+        ffn_dim: Feed-forward hidden size (defaults to ``4 * d_model``).
+        dropout: Dropout rate.
+        max_len: Maximum sequence length (relative embedding capacity).
+        causal: Whether attention is causal (lower-triangular).
+    """
+    def __init__(self, d_model, num_heads, num_layers=2, ffn_dim=None, dropout=0.1,
+                 max_len=1024, causal=False):
+        super().__init__()
+        ffn_dim = ffn_dim or (4 * d_model)
+        self.layers = nn.ModuleList([
+            _RelativeTransformerBlock(d_model, num_heads, ffn_dim, dropout, max_len, causal)
+            for _ in range(num_layers)
+        ])
+        self.layer_norm = nn.LayerNorm(d_model)
+
+    def forward(self, x, lengths=None):
+        # x: (B, T, d_model); lengths: (B,) valid lengths (optional)
+        key_padding_mask = None
+        if lengths is not None:
+            T = x.size(1)
+            key_padding_mask = torch.arange(T, device=x.device).unsqueeze(0) >= lengths.unsqueeze(1)
+        for layer in self.layers:
+            x = layer(x, key_padding_mask)
+        return self.layer_norm(x)
 
 
 # ==============================================================================

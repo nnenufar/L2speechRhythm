@@ -17,7 +17,7 @@ import pandas as pd
 from pathlib import Path
 from datetime import datetime
 
-from src.models import RhythmRegressor
+from src.models import DurationRegressor, RhythmRegressor
 from src.dataloaders import DatasetLMDB, collate_fn
 from src.evaluation import collect_regression_predictions
 from torch.utils.data import DataLoader
@@ -41,17 +41,43 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime('%Y%m%d_%H%M')
 
+    model_type = config.get('model_type', 'rhythm_regressor')
+    dataset_params = dict(config['dataset_params'])
+
+    vc_features = None
+    num_tokens = None
+    max_phones = None
+    if model_type == 'duration_regressor':
+        vc_path = dataset_params.pop(
+            'vc_features_path', 'data/speechocean/vc_features.json'
+        )
+        with open(vc_path, 'r') as f:
+            vc_data = json.load(f)
+        vc_features = vc_data['samples']
+        num_tokens = len(vc_data['vocab'])
+        max_v = max(max(len(p) for p in s.get('v_phones', [])) for s in vc_features.values())
+        max_c = max(max(len(p) for p in s.get('c_phones', [])) for s in vc_features.values())
+        max_phones = max(max_v, max_c)
+
     dataset = DatasetLMDB(
-        config['dataset_params']['lmdb_path'],
-        data_source=config['dataset_params']['data_source'],
+        dataset_params['lmdb_path'],
+        data_source=dataset_params['data_source'],
         split=args.split,
-        items=config['dataset_params']['items'],
-        test_size=config['dataset_params'].get('test_size', 0.20),
-        label_column=config['dataset_params'].get('label_column', 'fluency'),
+        items=dataset_params['items'],
+        test_size=dataset_params.get('test_size', 0.20),
+        label_column=dataset_params.get('label_column', 'fluency'),
+        vc_features=vc_features,
     )
     print(f"Split: {args.split}, samples: {len(dataset)}")
 
-    model = RhythmRegressor(**config['model_params']).to(device)
+    model_kwargs = {**config['model_params']}
+    if model_type == 'duration_regressor':
+        model_kwargs['num_tokens'] = num_tokens
+        model_kwargs['max_phones'] = max_phones
+        model = DurationRegressor(**model_kwargs).to(device)
+    else:
+        model = RhythmRegressor(**model_kwargs).to(device)
+
     checkpoint = torch.load(args.checkpoint, map_location=device)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()

@@ -207,7 +207,9 @@ marimo/_lsp/
 __marimo__/
 
 data
-exp
 slurm/out
 analysis/rhythm_encoder
 AGENTS.md
+config/dump
+exp
+.claude

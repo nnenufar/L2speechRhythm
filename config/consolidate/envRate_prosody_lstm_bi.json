@@ -16,9 +16,9 @@
     "main_item": "envelope_derivative",
     "use_transformer": false,
     "lstm_bidirectional": true,
-    "d_model": 128,
-    "lstm_num_layers": 2,
+    "d_model": 32,
     "lstm_hidden_size": 128,
+    "lstm_num_layers": 2,
     "num_heads": 2,
     "num_layers": 2,
     "max_len": 256

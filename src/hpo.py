@@ -2,8 +2,7 @@
 
 Runs a config-driven sweep: each trial deep-copies a base config, samples the
 search space defined in its ``"hpo"`` block, and calls ``src.train.train`` with a
-per-trial experiment name. The objective is the best validation metric tracked by
-``train`` (``val_f1`` for classification, ``val_spearman_r`` for regression).
+per-trial experiment name. The objective is validation Spearman r.
 
 Usage:
     python -m src.hpo --config config/<name>.json [--n_trials N]

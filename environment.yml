@@ -12,6 +12,9 @@ dependencies:
   - scikit-learn
   - scipy
   - pandas
+  - lmdb
+  - optuna
+  - wandb
   - pip:
     - soundfile
     - torch

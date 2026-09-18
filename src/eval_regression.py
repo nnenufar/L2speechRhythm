@@ -1,11 +1,11 @@
 """
-Evaluate a trained RhythmRegressor on a dataset split.
+Evaluate a trained regression model on a dataset split.
 Saves per-sample predictions CSV and aggregate metrics JSON.
 
 Usage:
     python -m src.eval_regression \
-        --config config/rhythm_regression_speechocean.json \
-        --checkpoint exp/rhythm_regression_speechocean/checkpoints/<ts>/best_model.pth \
+        --config config/consolidate/<config>.json \
+        --checkpoint exp/<exp>/checkpoints/<ts>/best_model_epochN.pth \
         --split Test
 """
 

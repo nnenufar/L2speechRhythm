@@ -24,7 +24,7 @@ for split in splits:
     print(f"Split: {split}")
     print("=" * 70)
 
-    dataset = DatasetLMDB('data/speechocean/rtm_feats.lmdb', data_source='speechocean',
+    dataset = DatasetLMDB('data/speechocean/rtm_feats.lmdb', data_source='speechocean_custom',
                           split=split, items=items, vc_features=vc_features)
 
     print(f"Number of samples: {len(dataset)}")
@@ -49,7 +49,7 @@ print("\n" + "=" * 70)
 print("Batch Test (Train split)")
 print("=" * 70)
 
-dataset = DatasetLMDB('data/speechocean/rtm_feats.lmdb', data_source='speechocean',
+dataset = DatasetLMDB('data/speechocean/rtm_feats.lmdb', data_source='speechocean_custom',
                       split='Train', items=items, vc_features=vc_features)
 dataloader = DataLoader(dataset, batch_size=32, collate_fn=collate_fn, shuffle=True)
 batch = next(iter(dataloader))

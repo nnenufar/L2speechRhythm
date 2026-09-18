@@ -1,4 +1,4 @@
-from src.dataloaders import DatasetLMDB, collate_fn, processor_ssl
+from src.dataloaders import DatasetLMDB, collate_fn
 from torch.utils.data import DataLoader
 from src import train_utils
 from collections import Counter
@@ -16,7 +16,7 @@ for split in splits:
     print(f"Split: {split}")
     print("="*70)
     
-    dataset = DatasetLMDB('data/speechocean/rtm_feats.lmdb', data_source='speechocean', split=split, items=items)
+    dataset = DatasetLMDB('data/speechocean/rtm_feats.lmdb', data_source='speechocean_custom', split=split, items=items)
     
     print(f"Number of samples: {len(dataset)}")
     print(f"Unique speakers: {len(dataset.speaker_str2int)}")
@@ -31,10 +31,10 @@ print("\n" + "="*70)
 print("Batch Test (Train split)")
 print("="*70)
 
-collateFunc = processor_ssl if 'waveform' in items else collate_fn
+collateFunc = collate_fn
 
 # Test batch loading with Train split
-dataset = DatasetLMDB('data/speechocean/rtm_feats.lmdb', data_source='speechocean', split='Train', items=items)
+dataset = DatasetLMDB('data/speechocean/rtm_feats.lmdb', data_source='speechocean_custom', split='Train', items=items)
 #sampler = train_utils.create_weighted_sampler(dataset, str_counts)
 str_counts = Counter(dataset.labels.values())
 

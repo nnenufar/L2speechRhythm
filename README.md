@@ -1,210 +1,173 @@
-Speech rhythm analysis tools
+# Automated Assessment of L2 Speech Rhythm Using Low-Frequency Amplitude Modulations
 
-# Code purpose and functionalities
+This repository contains the code to reproduce the experiments performed in the "Automated Assessment of L2 Speech Rhythm Using Low-Frequency Amplitude Modulations" paper (IEEE SLT 2026). The supported models are:
 
-The ``vowel_beat_detector`` submodule provides rhythmic feature extraction tools (check the submodule's README.md for more details). The source code at root provides deep learning resources to process these features and perform feature learning and classification tasks.
+- `RhythmRegressor`: amplitude envelope or envelope-derivative input
+  (`env`, `envRate`)
+- `DurationRegressor`: vocalic/intervocalic phone-duration input (`dur`, `durZ`)
 
-# Quick start
+All eight consolidated experiment configurations are in `config/consolidate/`.
+The corresponding final test-set metrics and predictions are in
+`exp/consolidate/<experiment>/eval/`.
 
-1. Clone this repository and set up the environment
-    ```
-    cd <path to cloned repo>
-    conda env create -f environment.yml
-    conda activate rtm
-    ```
+## Repository layout
 
-2. Download datasets and extract features
-    ```
-    python vowel_beat_detector/src/main.py \
-    -in <dataset_path> \
-    -out data/<dataset_name> \
-    -sr 16000
-    ```
-    Our experiments use the mTEDx_pt and g_neutral_speech_male datasets and automatically resample all audios to 16kHz. More detailed insctructions on how to download and process the datasets can be found in [TODO: add data processing scripts]
+```text
+config/consolidate/         Final experiment configs
+exp/consolidate/            Final test metrics, predictions, and HPO best params
+src/                        Model, dataloader, training, HPO, and inference code
+slurm/                      Slurm templates for training, HPO, evaluation, and MFA
+speech_feature_extractor/   Feature extraction submodule
+utils/                      Speechocean metadata and VC-feature preparation tools
+test/                       Dataloader smoke tests
+environment.yml             Python environment
+```
 
-    The features will be extracted into a ``.lmdb`` file. Each entry in the file can be read similarly to a python dictionary where item corresponds to a type of feature. 
+## 1. Environment
 
-3. Set up the dataloader
+Initialize the feature-extractor submodule:
 
-    If you're implementing your own dataset, you will need to build a pytorch-style dataloader for it then add the dataset name in the training script.
+```bash
+git submodule update --init --recursive
+```
 
-    If you're using the already implemented datasets, simply use the dataset name in the training config file.
-
-    The adopted approach is to specify samples IDs with data_sources.py then feed them to the DatasetLMDB class and create a dataloader from it.
-
-    data_sources looks at the CSV file created with create_arctic_data.py
-
-4. Config file
-    Specify all desired training and model parameters in a ``.json`` file inside ``/config``
-
-5. Run training script
-    ```
-    python -m src.train --config <config_path>
-    ```
-
-6. Follow experiment
-    Training and evaluation metrics, as well as checkpoints, will be saved under ``/exp`` with the ``exp_name`` as defined in the used config file.
-
-
----
-
-# Reproducing experiments
-
-This section describes how to reproduce the experiments from the thesis. All experiments use the Speechocean dataset (performers reading a common English text, scored on fluency and prosodic control).
-
-## Experiment A overview
-
-| Sub-experiment | Model | Input | Target | Config |
-|---|---|---|---|---|
-| A1c (envelope) | RhythmRegressor | Amplitude envelope | fluency | `exp_A1c_env_fluency_expand.json` |
-| A1c (envelope) | RhythmRegressor | Amplitude envelope | prosodic | `exp_A1c_env_prosody_expand.json` |
-| A2c (duration) | DurationRegressor | V/C interval durs + phone IDs | fluency | `exp_A2c_dur_fluency.json` |
-| A2c (duration) | DurationRegressor | V/C interval durs + phone IDs | prosodic | `exp_A2c_dur_prosody.json` |
-| A2Zc (duration Z) | DurationRegressor | V/C interval durs (z-scored) + phone IDs | fluency | `exp_A2c_durZ_fluency.json` |
-| A2Zc (duration Z) | DurationRegressor | V/C interval durs (z-scored) + phone IDs | prosodic | `exp_A2c_durZ_prosody.json` |
-| A3c (env. derivative) | RhythmRegressor | Envelope derivative | fluency | `exp_A3c_envRate_fluency_expand.json` |
-| A3c (env. derivative) | RhythmRegressor | Envelope derivative | prosodic | `exp_A3c_envRate_prosody_expand.json` |
-
-## Prerequisites
-
-Before running any experiment, ensure the following data is available:
-
-| Path | Description |
-|---|---|
-| `<speechocean_wavs_dir>/` | Directory tree with 16 kHz mono WAVs, organised as `<speakerID>/<uttID>.WAV` |
-| `<scores.json>` | JSON mapping `uttID` → `{fluency, prosodic}` scores |
-| `<train/utt2spk>` | Kaldi-format utt2spk file for the training set |
-| `<test/utt2spk>` | Kaldi-format utt2spk file for the test set |
-| `data/speechocean/alignments/` | MFA forced alignments, one `.TextGrid` per utterance, in speaker subdirs (A2/A2Z only) |
-
-## Step-by-step: Experiment A
-
-### Step 1 — Environment
+Create and activate the main environment:
 
 ```bash
 conda env create -f environment.yml
 conda activate rtm
 ```
 
-### Step 2 — Extract rhythmic features
+The consolidated code requires Python 3.10, PyTorch, NumPy, Pandas, SciPy,
+scikit-learn, Matplotlib, lmdb, Optuna, and wandb. Forced alignment for
+`dur`/`durZ` preparation requires `montreal-forced-aligner`.
 
-Run the `vowel_beat_detector` submodule on the Speechocean audio. This produces a single LMDB database with amplitude envelopes, beat locations, and other per-sample features.
+## 2. Required data
+
+The training and evaluation code expects:
+
+| Path | Description |
+|---|---|
+| `data/speechocean/rtm_feats.lmdb` | LMDB with envelope and envelope-derivative sequences |
+| `data/speechocean/speechocean_metadata.csv` | Identifier -> fluency/prosodic score |
+| `data/speechocean/vc_features.json` | Tokenized V/C intervals and phone durations for `dur`/`durZ` |
+
+The first two files can be created from Speechocean WAVs, score files, and
+Kaldi-style `utt2spk` files as described below.
+
+## 3. Build Speechocean metadata
+
+Extract the envelope/envelope-derivative LMDB used by the consolidated models:
 
 ```bash
-python vowel_beat_detector/src/main.py \
-    -in <speechocean_wavs_dir> \
-    -out data/speechocean \
-    -sr 16000
+bash utils/extract_features.sh /path/to/speechocean/wavs data/speechocean bark
 ```
 
-Output: `data/speechocean/rtm_feats.lmdb`
-
-### Step 3 — Build the Speechocean metadata CSV
-
-Maps LMDB keys to fluency/prosodic scores and assigns each utterance to a train/test split.
+Then create the metadata CSV:
 
 ```bash
 python utils/create_speechocean_table.py \
     --lmdb data/speechocean/rtm_feats.lmdb \
-    --scores <scores.json> \
-    --train_utt2spk <train/utt2spk> \
-    --test_utt2spk <test/utt2spk> \
+    --scores /path/to/scores.json \
+    --train_utt2spk /path/to/train_utt2spk \
+    --test_utt2spk /path/to/test_utt2spk \
     --output data/speechocean/speechocean_metadata.csv
 ```
 
-Output: `data/speechocean/speechocean_metadata.csv`
+## 4. Build duration features
 
-### Step 4 — Build VC features (duration experiments only)
+Only required for `dur` and `durZ` experiments.
 
-Required for A2 and A2Z. Skip to Step 5 if only running A1/A3.
+1. Prepare MFA input and run forced alignment:
 
-First, run MFA forced alignment. Launch `slurm/mfa_align.sh` on a cluster, or run manually. This produces `data/speechocean/phone_alignments.json`.
+```bash
+sbatch slurm/mfa_align.sh
+```
 
-Then build the remaining VC data files with the convenience script:
+2. Build V/C alignments, z-scored phone durations, and tokenized VC features:
 
 ```bash
 bash utils/build_vc_pipeline.sh data/speechocean
 ```
 
-Outputs (under `data/speechocean/`):
-- `vc_alignments.json` — V/C segment boundaries, phone durations, z-scored durations
-- `phone_duration_stats.json` — per-phone mean/std used for z-scoring
-- `vc_features.json` — tokenised phone sequences + interval durations consumed by the `DurationRegressor`
+This creates `vc_alignments.json`, `phone_duration_stats.json`, and
+`vc_features.json`.
 
-### Step 5 — Verify the dataloader (optional)
+## 5. Verify dataloaders
 
 ```bash
-python test/test_dataloader.py
+python -m test.test_dataloader
+python -m test.test_duration_dataloader
 ```
 
-For duration experiments:
+## 6. Train a single experiment
 
 ```bash
-python test/test_duration_dataloader.py
+python -m src.train --config config/consolidate/<config>.json
 ```
 
-### Step 6 — Train the models
-
-Each sub-experiment has its own config in `config/`. Training uses random stratified splits (80/10/10), with early stopping on validation Spearman r (patience=50). All configs use `"collate_fn": "pad"` (no WavLM).
-
-To launch training on a cluster, use `slurm/exp_A.sh` as a template — edit the `--config` path to point to your target config.
-
-**Rhythm Regressor — envelope (A1)**
+On Slurm:
 
 ```bash
-python -m src.train --config config/exp_A1c_env_fluency_expand.json
-python -m src.train --config config/exp_A1c_env_prosody_expand.json
+sbatch slurm/train.sh config/consolidate/<config>.json
 ```
 
-**Rhythm Regressor — envelope derivative (A3)**
+Training uses MSE, gradient clipping at 5.0, and early stopping on validation
+Spearman r. Outputs are written under `exp/<exp_name>/`.
+
+## 7. Run hyperparameter search
 
 ```bash
-python -m src.train --config config/exp_A3c_envRate_fluency_expand.json
-python -m src.train --config config/exp_A3c_envRate_prosody_expand.json
+python -m src.hpo \
+    --config config/consolidate/<config>.json \
+    --n_trials 80
 ```
 
-**Duration Regressor — raw phone durations (A2)**
+On Slurm:
 
 ```bash
-python -m src.train --config config/exp_A2c_dur_fluency.json
-python -m src.train --config config/exp_A2c_dur_prosody.json
+sbatch slurm/hpo.sh config/consolidate/<config>.json 80
 ```
 
-**Duration Regressor — z-scored phone durations (A2Z)**
+HPO selects the best trial on validation Spearman r and automatically runs
+test-set inference with the best checkpoint.
 
-```bash
-python -m src.train --config config/exp_A2c_durZ_fluency.json
-python -m src.train --config config/exp_A2c_durZ_prosody.json
-```
-
-### Step 7 — Where outputs are saved
-
-All results land under `exp/<exp_name>/` with the following structure:
-
-| Path | Contents |
-|---|---|
-| `checkpoints/<timestamp>/` | Best-model checkpoints (`best_model_epochN.pth`) |
-| `plots/` | Training curves (loss, RMSE, Pearson r) |
-| `dev_results/<timestamp>/` | `dev_results_<timestamp>.json` with final dev metrics |
-| `eval/` | Per-sample predictions CSV + summary JSON (generated at dev time) |
-
-Each checkpoint contains model weights, optimizer state, and the `utterance_str2int` mapping needed for inference.
-
-### Step 8 — Run inference on a trained checkpoint
+## 8. Evaluate a trained checkpoint
 
 ```bash
 python -m src.eval_regression \
-    --config config/exp_A1c_env_fluency_expand.json \
-    --checkpoint exp/exp_A1c_env_fluency_expand/checkpoints/<ts>/best_model_epochN.pth \
+    --config config/consolidate/<config>.json \
+    --checkpoint /path/to/best_model_epochN.pth \
     --split Test
 ```
 
-Per-sample predictions (`predictions_Test_<ts>.csv`) and aggregate metrics (`summary_Test_<ts>.json`) are saved under `exp/<exp_name>/eval/`. On a cluster, use `slurm/eval_regression.sh` as a template.
+On Slurm:
 
-### Notes
+```bash
+sbatch slurm/eval.sh \
+    config/consolidate/<config>.json \
+    /path/to/best_model_epochN.pth \
+    Test
+```
 
-- **Split strategy**: The `speechocean_custom` data source uses random stratified splits on fluency/prosodic scores (80/10/10). The original `speechocean` data source uses the predefined train/test split from the utt2spk files.
-- **No pretrained encoder**: The A1 and A3 configs do not specify a `pretrained_checkpoint`, so the `RhythmRegressor` trains its encoder from scratch. To use a contrastively pretrained encoder (experiment B1), add `"pretrained_checkpoint": "<path>"` to `model_params`.
-- **Gradient clipping**: hardcoded to `max_norm=5.0` (`src/train.py:275`).
-- **WavLM cache path**: hardcoded in `src/dataloaders.py:117` to `/home/joao.lima/.cache/huggingface/hub/`. Change this if running on a different machine (not needed for experiment A, which does not use WavLM).
-- **W&B logging**: defaults to `"mode": "offline"`. Set `"mode": "online"` in the `wandb` config block to log to a server.
+## 9. Consolidated results
+
+The final configurations and their result directories are:
+
+| Input | Fluency | Prosodic |
+|---|---|---|
+| Envelope | `env_fluency_lstm_bi` | `env_prosody_lstm_bi` |
+| Envelope derivative | `envRate_fluency_lstm_bi` | `envRate_prosody_lstm_bi` |
+| Phone durations | `dur_fluency_lstm_bi` | `dur_prosody_lstm_bi` |
+| Z-scored phone durations | `durZ_fluency_lstm_bi` | `durZ_prosody_lstm_bi` |
+
+For each experiment, the final metrics are in:
+
+```text
+exp/consolidate/<experiment>/eval/summary_Test_*.json
+exp/consolidate/<experiment>/eval/predictions_Test_*.csv
+```
+
+Fluency experiments also include `hpo_best.json` with the selected
+hyperparameters. Prosody experiments reuse the corresponding fluency
+hyperparameters.

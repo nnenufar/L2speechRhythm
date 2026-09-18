@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=hpo_dur_trf
+#SBATCH --job-name=rhythm_hpo
 #SBATCH --output=/home/joao.lima/experiments/rhythm_classifier/slurm/out/hpo_%j.out
 #SBATCH --error=/home/joao.lima/experiments/rhythm_classifier/slurm/out/hpo_%j.err
 #SBATCH --ntasks=1
@@ -10,13 +10,14 @@
 #SBATCH --mem=15G
 
 export HOME=/home/$USER
-export HF_HOME=/home/joao.lima/.cache/huggingface/hub/
-export TRANSFORMERS_OFFLINE=1
 export WANDB_MODE=offline
 
 source ~/miniconda3/bin/activate
 conda activate rtm
 
+CONFIG="${1:?usage: sbatch slurm/hpo.sh config/consolidate/<config>.json [n_trials]}"
+N_TRIALS="${2:-80}"
+
 python -m src.hpo \
-    --config config/consolidate/env_fluency_lstm_bi.json \
-    --n_trials 80
+    --config "$CONFIG" \
+    --n_trials "$N_TRIALS"

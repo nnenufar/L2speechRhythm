@@ -5,21 +5,23 @@
   "collate_fn": "pad",
   "model_params": {
     "freeze_encoder": false,
-    "hidden_size": 64,
+    "hidden_size": 128,
     "dropout": 0.1,
     "feat_dim": 1,
-    "kernel_size": 3,
-    "cnn_out_channels": 32,
+    "kernel_size": 7,
+    "cnn_out_channels": 128,
     "num_cnn_layers": 3,
     "cnn_stride": [3,4,5],
     "task": "regression",
     "main_item": "envelope_derivative",
     "use_transformer": false,
     "lstm_bidirectional": true,
-    "d_model": 64,
+    "d_model": 32,
     "num_heads": 2,
     "num_layers": 2,
-    "max_len": 256
+    "max_len": 256,
+    "lstm_hidden_size": 128,
+    "lstm_num_layers": 2
   },
   "dataset_params": {
     "lmdb_path": "data/speechocean/rtm_feats.lmdb",
@@ -29,7 +31,7 @@
     "label_column": "fluency"
   },
   "training_params": {
-    "learning_rate": 1e-3,
+    "learning_rate": 1e-4,
     "num_epochs": 1000,
     "weight_decay": 1e-5,
     "plot_every": 10,

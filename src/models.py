@@ -1,114 +1,73 @@
-import torch
 import inspect
-from transformers import WavLMModel
-import torch.nn.functional as F
+
+import torch
 import torch.nn as nn
-from src.modules import *
+import torch.nn.functional as F
+
+from src.modules import AttentionPooling, Conv1dStack, LSTMEncoder, MLP
 
 
 class RhythmEncoder(nn.Module):
-    """
-    Encoder for amplitude envelope sequences.
-    CNN + LSTM/transformer + attention pooling → embedding.
-    """
+    """CNN + bidirectional LSTM + attention pooling for envelope sequences."""
+
     def __init__(self,
                  feat_dim=1,
                  kernel_size=3,
                  cnn_out_channels=64,
                  num_cnn_layers=3,
                  cnn_stride=1,
-                 cnn_backbone='conv',
-                 inception_depth=3,
-                 inception_stride=2,
-                 inception_kernel_sizes=(10, 20, 40),
-                 inception_norm='batch',
                  lstm_hidden_size=64,
                  lstm_num_layers=1,
                  lstm_bidirectional=True,
                  attn_hidden_dim=None,
                  attn_pool_mode='sigmoid',
                  attn_tau=0.3,
-                 dropout=0.1,
-                 use_transformer=False,
-                 d_model=64,
-                 num_heads=4,
-                 num_layers=2,
-                 ffn_dim=None,
-                 max_len=1024,
-                 causal=False):
+                 dropout=0.1):
         super().__init__()
 
         self.attn_tau = attn_tau
-        self.use_transformer = use_transformer
-        self.cnn_backbone = cnn_backbone
-        audio_dim = d_model if use_transformer else lstm_hidden_size * (2 if lstm_bidirectional else 1)
 
-        if cnn_backbone == 'conv':
-            self.cnn_encoder = Conv1dStack(
-                in_channels=feat_dim,
-                hidden_channels=cnn_out_channels * 2,
-                out_channels=cnn_out_channels,
-                kernel_size=kernel_size,
-                num_layers=num_cnn_layers,
-                activation='relu',
-                dropout=dropout,
-                norm='layer',
-                stride=cnn_stride
-            )
-            cnn_out_features = cnn_out_channels
-        elif cnn_backbone == 'inception':
-            self.cnn_encoder = InceptionTimeStack(
-                in_channels=feat_dim,
-                filters=cnn_out_channels,
-                num_blocks=inception_depth,
-                kernel_sizes=inception_kernel_sizes,
-                stride=inception_stride,
-                norm=inception_norm,
-            )
-            cnn_out_features = 4 * cnn_out_channels
-        else:
-            raise ValueError(f"Unsupported cnn_backbone: {cnn_backbone!r}")
+        self.cnn_encoder = Conv1dStack(
+            in_channels=feat_dim,
+            hidden_channels=cnn_out_channels * 2,
+            out_channels=cnn_out_channels,
+            kernel_size=kernel_size,
+            num_layers=num_cnn_layers,
+            activation='relu',
+            dropout=dropout,
+            norm='layer',
+            stride=cnn_stride,
+        )
 
-        if use_transformer:
-            self.input_proj = nn.Linear(cnn_out_features, d_model)
-            self.transformer = RelativeTransformerEncoder(
-                d_model=d_model, num_heads=num_heads, num_layers=num_layers,
-                ffn_dim=ffn_dim, dropout=dropout, max_len=max_len, causal=causal,
-            )
-        else:
-            self.lstm_encoder = LSTMEncoder(
-                input_size=cnn_out_features,
-                hidden_size=lstm_hidden_size,
-                num_layers=lstm_num_layers,
-                dropout=dropout,
-                bidirectional=lstm_bidirectional,
-                output_mode='all'
-            )
+        self.lstm_encoder = LSTMEncoder(
+            input_size=cnn_out_channels,
+            hidden_size=lstm_hidden_size,
+            num_layers=lstm_num_layers,
+            dropout=dropout,
+            bidirectional=lstm_bidirectional,
+            output_mode='all',
+        )
 
         self.lstm_attn_pool = AttentionPooling(
-            embed_dim=audio_dim,
+            embed_dim=self.lstm_encoder.output_size,
             hidden_dim=attn_hidden_dim,
             dropout=dropout,
-            mode=attn_pool_mode
+            mode=attn_pool_mode,
         )
-        self.embed_dim = audio_dim
 
+        self.embed_dim = self.lstm_encoder.output_size
         self.layer_norm = nn.LayerNorm(self.embed_dim)
 
     def forward(self, x, return_attention=False):
         if x.dim() == 2:
             x = x.unsqueeze(1)
+        elif x.dim() == 3:
+            x = x.permute(0, 2, 1)
 
         cnn_out = self.cnn_encoder(x)
         cnn_out = cnn_out.permute(0, 2, 1)
-
-        if self.use_transformer:
-            audio_features = self.transformer(self.input_proj(cnn_out))
-        else:
-            audio_features = self.lstm_encoder(cnn_out)
-
-        embeddings, attn_weights = self.lstm_attn_pool(audio_features, tau=self.attn_tau)
-
+        lstm_out = self.lstm_encoder(cnn_out)
+        embeddings, attn_weights = self.lstm_attn_pool(lstm_out, tau=self.attn_tau)
         embeddings = self.layer_norm(embeddings)
 
         if return_attention:
@@ -116,40 +75,9 @@ class RhythmEncoder(nn.Module):
         return embeddings
 
 
-class RhythmContrastiveModel(nn.Module):
-    """
-    Rhythm encoder + projection head for contrastive pretraining.
-    Forward pass: encoder → MLP projection → L2-normalize.
-    The encoder output is the representation used for downstream tasks.
-    """
-    def __init__(self, proj_hidden_dim=128, proj_out_dim=64, proj_num_layers=2,
-                 proj_dropout=0.0, **encoder_kwargs):
-        super().__init__()
-        self.encoder = RhythmEncoder(**encoder_kwargs)
-        self.projection = MLP(
-            in_features=self.encoder.embed_dim,
-            hidden_features=proj_hidden_dim,
-            out_features=proj_out_dim,
-            num_layers=proj_num_layers,
-            activation='relu',
-            dropout=proj_dropout,
-            norm=None
-        )
-
-    def forward(self, x):
-        embeddings = self.encoder(x)
-        projected = self.projection(embeddings)
-        return F.normalize(projected, dim=-1)
-
-
 class RhythmRegressor(nn.Module):
-    """
-    Pretrained RhythmEncoder + regression head for fluency score prediction.
-    Loads encoder weights from a contrastive checkpoint, adds an MLP head.
+    """RhythmEncoder + regression head for envelope/envelope-derivative models."""
 
-    freeze_encoder: False (train all), True / "encoder_all" (freeze entire encoder),
-                    or "cnn_only" (freeze CNN stack, train LSTM + attention pool).
-    """
     def __init__(self, pretrained_checkpoint=None, freeze_encoder=True,
                  hidden_size=32, dropout=0.1, main_item='envelope', **kwargs):
         super().__init__()
@@ -162,9 +90,11 @@ class RhythmRegressor(nn.Module):
 
         if pretrained_checkpoint is not None:
             checkpoint = torch.load(pretrained_checkpoint, map_location='cpu')
-            encoder_state = {k.removeprefix('encoder.'): v
-                             for k, v in checkpoint['model_state_dict'].items()
-                             if k.startswith('encoder.')}
+            encoder_state = {
+                k.removeprefix('encoder.'): v
+                for k, v in checkpoint['model_state_dict'].items()
+                if k.startswith('encoder.')
+            }
             self.encoder.load_state_dict(encoder_state, strict=False)
 
         if freeze_encoder is True or freeze_encoder == 'encoder_all':
@@ -181,7 +111,7 @@ class RhythmRegressor(nn.Module):
             num_layers=1,
             activation='relu',
             dropout=dropout,
-            norm='layer'
+            norm='layer',
         )
 
     def forward(self, batch, return_attention=False):
@@ -190,6 +120,7 @@ class RhythmRegressor(nn.Module):
             emb, attn = self.encoder(x, return_attention=True)
         else:
             emb = self.encoder(x)
+
         out = self.head(emb).squeeze(-1)
         if return_attention:
             return out, attn
@@ -197,51 +128,38 @@ class RhythmRegressor(nn.Module):
 
 
 class DurationRegressor(nn.Module):
-    """
-    Vocalic + intervocalic interval sequences → LSTM → attention pooling → regression.
-    Each phone in an interval is embedded individually, concatenated with its per-phone
-    duration, then all sub-segments are concatenated (padded to max_phones) and appended
-    with the total interval duration.
-    """
+    """Vocalic/intervocalic duration sequences -> LSTM -> attention pooling -> regression."""
+
     def __init__(self, num_tokens, phone_embed_dim=64, lstm_hidden_size=64,
                  lstm_num_layers=1, dropout=0.1, hidden_size=32, max_phones=5,
-                 use_phone_durs_z=False, use_transformer=False, d_model=64,
-                 num_heads=4, num_layers=2, ffn_dim=None, max_len=1024,
-                 causal=False, **kwargs):
+                 use_phone_durs_z=False, **kwargs):
         super().__init__()
 
         self.max_phones = max_phones
         self.use_phone_durs_z = use_phone_durs_z
-        self.use_transformer = use_transformer
         input_dim = (phone_embed_dim + 1) * max_phones + 1
-        pool_embed = d_model if use_transformer else lstm_hidden_size * 2
+        pool_embed = lstm_hidden_size * 2
 
         self.phone_embedding = nn.Embedding(num_tokens, phone_embed_dim, padding_idx=0)
 
-        if use_transformer:
-            self.proj_v = nn.Linear(input_dim, d_model)
-            self.transformer_v = RelativeTransformerEncoder(
-                d_model=d_model, num_heads=num_heads, num_layers=num_layers,
-                ffn_dim=ffn_dim, dropout=dropout, max_len=max_len, causal=causal,
-            )
-            self.proj_c = nn.Linear(input_dim, d_model)
-            self.transformer_c = RelativeTransformerEncoder(
-                d_model=d_model, num_heads=num_heads, num_layers=num_layers,
-                ffn_dim=ffn_dim, dropout=dropout, max_len=max_len, causal=causal,
-            )
-        else:
-            self.lstm_v = LSTMEncoder(
-                input_size=input_dim, hidden_size=lstm_hidden_size,
-                num_layers=lstm_num_layers, dropout=dropout,
-                bidirectional=True, output_mode='all'
-            )
-            self.lstm_c = LSTMEncoder(
-                input_size=input_dim, hidden_size=lstm_hidden_size,
-                num_layers=lstm_num_layers, dropout=dropout,
-                bidirectional=True, output_mode='all'
-            )
-            self.ln_v = nn.LayerNorm(input_dim)
-            self.ln_c = nn.LayerNorm(input_dim)
+        self.lstm_v = LSTMEncoder(
+            input_size=input_dim,
+            hidden_size=lstm_hidden_size,
+            num_layers=lstm_num_layers,
+            dropout=dropout,
+            bidirectional=True,
+            output_mode='all',
+        )
+        self.lstm_c = LSTMEncoder(
+            input_size=input_dim,
+            hidden_size=lstm_hidden_size,
+            num_layers=lstm_num_layers,
+            dropout=dropout,
+            bidirectional=True,
+            output_mode='all',
+        )
+        self.ln_v = nn.LayerNorm(input_dim)
+        self.ln_c = nn.LayerNorm(input_dim)
 
         self.attn_pool_v = AttentionPooling(
             embed_dim=pool_embed, hidden_dim=None, dropout=dropout, mode='sigmoid'
@@ -251,9 +169,13 @@ class DurationRegressor(nn.Module):
         )
 
         self.head = MLP(
-            in_features=pool_embed * 2, hidden_features=hidden_size,
-            out_features=1, num_layers=1, activation='relu',
-            dropout=dropout, norm='layer'
+            in_features=pool_embed * 2,
+            hidden_features=hidden_size,
+            out_features=1,
+            num_layers=1,
+            activation='relu',
+            dropout=dropout,
+            norm='layer',
         )
 
     def _embed_intervals(self, phones, phone_durs, dur):
@@ -268,9 +190,7 @@ class DurationRegressor(nn.Module):
             phone_durs = phone_durs[:, :, :self.max_phones]
 
         phone_durs = phone_durs.clamp(-5, 5)
-
         subseg = torch.cat([emb, phone_durs.unsqueeze(-1)], dim=-1)
-
         flat = subseg.reshape(*subseg.shape[:-2], -1)
         return torch.cat([flat, dur.unsqueeze(-1)], dim=-1)
 
@@ -283,291 +203,13 @@ class DurationRegressor(nn.Module):
         v_lengths = (batch['v_dur'] != 0).sum(dim=1).clamp(min=1)
         c_lengths = (batch['c_dur'] != 0).sum(dim=1).clamp(min=1)
 
-        if self.use_transformer:
-            v_enc = self.transformer_v(self.proj_v(v_feat), v_lengths)
-            c_enc = self.transformer_c(self.proj_c(c_feat), c_lengths)
-        else:
-            v_enc = self.lstm_v(self.ln_v(v_feat), v_lengths)
-            c_enc = self.lstm_c(self.ln_c(c_feat), c_lengths)
+        v_enc = self.lstm_v(self.ln_v(v_feat), v_lengths)
+        c_enc = self.lstm_c(self.ln_c(c_feat), c_lengths)
 
         h_v, attn_v = self.attn_pool_v(v_enc)
         h_c, attn_c = self.attn_pool_c(c_enc)
-
         out = self.head(torch.cat([h_v, h_c], dim=-1)).squeeze(-1)
 
         if return_attention:
             return out, {'v': attn_v, 'c': attn_c}
         return out
-
-
-class RhythmFeatureMLP(nn.Module):
-    """
-    Non-deep-learning baseline: a small MLP over 6 scalar rhythm metrics
-    (nPVI-V/C, rPVI-V/C, delta-V/C) predicting a proficiency score.
-    """
-    def __init__(self, in_features=6, hidden_size=32, num_layers=2, dropout=0.0, **kwargs):
-        super().__init__()
-        self.head = MLP(
-            in_features=in_features,
-            hidden_features=hidden_size,
-            out_features=1,
-            num_layers=num_layers,
-            activation='relu',
-            dropout=dropout,
-            norm='layer',
-        )
-
-    def forward(self, batch, return_attention=False):
-        out = self.head(batch['features']).squeeze(-1)
-        if return_attention:
-            return out, None
-        return out
-
-
-class DurationContrastiveModel(nn.Module):
-    """
-    Duration-based contrastive pretraining: V/C duration sequences → LSTM → projection.
-    No phone identities — input is scalar duration per interval.
-    """
-    def __init__(self, lstm_hidden_size=64, lstm_num_layers=1, dropout=0.1,
-                 proj_hidden_dim=128, proj_out_dim=64, **kwargs):
-        super().__init__()
-
-        input_dim = 1
-        lstm_out = lstm_hidden_size * 2
-
-        self.lstm_v = LSTMEncoder(
-            input_size=input_dim, hidden_size=lstm_hidden_size,
-            num_layers=lstm_num_layers, dropout=dropout,
-            bidirectional=True, output_mode='all'
-        )
-        self.attn_pool_v = AttentionPooling(
-            embed_dim=lstm_out, hidden_dim=None, dropout=dropout, mode='sigmoid'
-        )
-
-        self.lstm_c = LSTMEncoder(
-            input_size=input_dim, hidden_size=lstm_hidden_size,
-            num_layers=lstm_num_layers, dropout=dropout,
-            bidirectional=True, output_mode='all'
-        )
-        self.attn_pool_c = AttentionPooling(
-            embed_dim=lstm_out, hidden_dim=None, dropout=dropout, mode='sigmoid'
-        )
-
-        embed_dim = lstm_out * 2
-        self.projection = MLP(
-            in_features=embed_dim, hidden_features=proj_hidden_dim,
-            out_features=proj_out_dim, num_layers=2,
-            activation='relu', dropout=dropout, norm=None
-        )
-
-    def forward(self, v_dur, c_dur):
-        v_feat = v_dur.unsqueeze(-1)
-        c_feat = c_dur.unsqueeze(-1)
-
-        v_lengths = (v_dur != 0).sum(dim=1).clamp(min=1)
-        c_lengths = (c_dur != 0).sum(dim=1).clamp(min=1)
-
-        v_lstm = self.lstm_v(v_feat, v_lengths)
-        h_v, _ = self.attn_pool_v(v_lstm)
-
-        c_lstm = self.lstm_c(c_feat, c_lengths)
-        h_c, _ = self.attn_pool_c(c_lstm)
-
-        emb = torch.cat([h_v, h_c], dim=-1)
-        projected = self.projection(emb)
-        return F.normalize(projected, dim=-1)
-
-
-class CNN_MLP(nn.Module):
-    """
-    CNN + LSTM + attention pooling with classification/regression head.
-    """
-    def __init__(self,
-                 feat_dim,
-                 kernel_size,
-                 hidden_size,
-                 num_classes,
-                 cnn_out_channels=None,
-                 num_cnn_layers=3,
-                 attn_hidden_dim=None,
-                 attn_pool_mode='sigmoid',
-                 attn_tau=2.0,
-                 dropout=0.1,
-                 cnn_stride=1,
-                 lstm_hidden_size=64,
-                 lstm_num_layers=1,
-                 lstm_bidirectional=True,
-                 main_item=None,
-                 f0_mean=None,
-                 f0_std=None,
-                 task='classification',
-                 target_mean=None,
-                 target_std=None,
-                 num_utterances=0,
-                 utterance_embed_dim=0):
-        super().__init__()
-
-        self.main_item = main_item
-        self.cnn_out_channels = cnn_out_channels if cnn_out_channels else feat_dim * 2
-        self.f0_mean = f0_mean
-        self.f0_std = f0_std
-        self.attn_tau = attn_tau
-        self.task = task
-        self.target_mean = target_mean
-        self.target_std = target_std
-
-        self.use_utterance_embedding = (utterance_embed_dim > 0 and num_utterances > 0)
-        if self.use_utterance_embedding:
-            self.utterance_embedding = nn.Embedding(num_utterances, utterance_embed_dim)
-        self._utterance_embed_dim = utterance_embed_dim
-
-        self.cnn_encoder = Conv1dStack(
-            in_channels=feat_dim,
-            hidden_channels=self.cnn_out_channels,
-            out_channels=self.cnn_out_channels,
-            kernel_size=kernel_size,
-            num_layers=num_cnn_layers,
-            activation='relu',
-            dropout=dropout,
-            norm='layer',
-            stride=cnn_stride
-        )
-
-        self.lstm_encoder = LSTMEncoder(
-            input_size=self.cnn_out_channels,
-            hidden_size=lstm_hidden_size,
-            num_layers=lstm_num_layers,
-            dropout=dropout,
-            bidirectional=lstm_bidirectional,
-            output_mode='all'
-        )
-
-        self.lstm_attn_pool = AttentionPooling(
-            embed_dim=self.lstm_encoder.output_size,
-            hidden_dim=attn_hidden_dim,
-            dropout=dropout,
-            mode=attn_pool_mode
-        )
-        self.embed_dim = self.lstm_encoder.output_size
-
-        fc_in_features = self.embed_dim + utterance_embed_dim if self.use_utterance_embedding else self.embed_dim
-
-        if task == 'regression':
-            self.fc = MLP(
-                in_features=fc_in_features,
-                hidden_features=hidden_size,
-                out_features=1,
-                num_layers=1,
-                activation='relu',
-                dropout=dropout,
-                norm='layer'
-            )
-        else:
-            self.fc = MLP(
-                in_features=fc_in_features,
-                hidden_features=hidden_size,
-                out_features=num_classes,
-                num_layers=1,
-                activation='relu',
-                dropout=dropout,
-                norm='layer'
-            )
-
-    def forward(self, batch, return_attention=False):
-        x = batch[self.main_item]
-
-        if self.main_item == 'f0':
-            mask = batch['voiced_mask'].bool()
-            f0_norm = torch.zeros_like(x)
-            f0_norm[mask] = (x[mask] - self.f0_mean) / (self.f0_std + 1e-8)
-            x = f0_norm
-
-        if x.dim() == 2:
-            x = x.unsqueeze(1)
-        elif x.dim() == 3:
-            x = x.permute(0, 2, 1)
-
-        cnn_out = self.cnn_encoder(x)
-        cnn_out = cnn_out.permute(0, 2, 1)
-
-        lstm_out = self.lstm_encoder(cnn_out)
-        embeddings, attn_weights = self.lstm_attn_pool(lstm_out, tau=self.attn_tau)
-
-        if self.use_utterance_embedding:
-            utterance_id = batch['utterance_id']
-            utt_embed = self.utterance_embedding(utterance_id)
-            embeddings = torch.cat([embeddings, utt_embed], dim=-1)
-
-        logits = self.fc(embeddings)
-
-        if self.task == 'regression':
-            logits = logits.squeeze(-1)
-
-        if return_attention and attn_weights is not None:
-            return logits, attn_weights
-
-        return logits
-    
-
-class WAV_LM(nn.Module):
-    def __init__(self, model_name, num_classes, hidden_size=128, attn_hidden_dim=None, 
-                 dropout=0.1, freeze_encoder=True, cache_dir=None, local_files_only=False,
-                 attn_pool_mode='sigmoid', attn_tau=2.0, use_attention_pooling=True):
-        super().__init__()
-        self.attn_tau = attn_tau
-        self.use_attn_pooling = use_attention_pooling
-        self.model = WavLMModel.from_pretrained(
-            model_name,
-            cache_dir=cache_dir,
-            local_files_only=local_files_only
-        )
-        
-        # Optionally freeze the encoder
-        if freeze_encoder:
-            for param in self.model.parameters():
-                param.requires_grad = False
-        
-        # Get hidden size from the model config
-        self.encoder_dim = self.model.config.hidden_size  # 1024 for large
-        
-        # Attention pooling
-        self.attn_pool = AttentionPooling(
-            embed_dim=self.encoder_dim,
-            hidden_dim=attn_hidden_dim,
-            dropout=dropout,
-            mode=attn_pool_mode
-        )
-        
-        # Classification head
-        self.fc = MLP(
-            in_features=self.encoder_dim,
-            hidden_features=hidden_size,
-            out_features=num_classes,
-            num_layers=1,
-            activation='relu',
-            dropout=dropout,
-            norm='layer'
-        )
-    
-    def forward(self, batch, return_attention=False):
-        waveform = batch['waveform']  # (B, T_samples)
-        
-        # Get WavLM hidden states
-        outputs = self.model(waveform)
-        hidden_states = outputs.last_hidden_state  # (B, T_frames, D)
-
-        if self.use_attn_pooling:
-            # Attention pooling
-            embeddings, attn_weights = self.attn_pool(hidden_states, tau=self.attn_tau)  # (B, D), (B, T_frames)
-        else:
-            embeddings = hidden_states.mean(dim=1)  # (B, D)
-            attn_weights = None
-
-        # Classification
-        logits = self.fc(embeddings)
-        
-        if return_attention:
-            return logits, attn_weights
-        
-        return logits

@@ -1,46 +1,173 @@
-Speech rhythm analysis tools
+# Automated Assessment of L2 Speech Rhythm Using Low-Frequency Amplitude Modulations
 
-# Code purpose and functionalities
+This repository contains the code to reproduce the experiments performed in the "Automated Assessment of L2 Speech Rhythm Using Low-Frequency Amplitude Modulations" paper (IEEE SLT 2026). The supported models are:
 
-This repository contains code associated with the Master's project titled "Enhancing duration prediction in deep learning TTS models from a psychoacoustic perspective of speech rhythm". The ``vowel_beat_detector`` submodule provides rhythmic feature extraction tools (check the submodule's README.md for more details). The source code at root provides deep learning resources to process these features and perform feature learning and classification tasks.
+- `RhythmRegressor`: amplitude envelope or envelope-derivative input
+  (`env`, `envRate`)
+- `DurationRegressor`: vocalic/intervocalic phone-duration input (`dur`, `durZ`)
 
-# Quick start
+All eight consolidated experiment configurations are in `config/consolidate/`.
+The corresponding final test-set metrics and predictions are in
+`exp/consolidate/<experiment>/eval/`.
 
-1. Clone this repository and set up the environment
-    ```
-    cd <path to cloned repo>
-    conda env create -f environment.yml
-    conda activate rtm
-    ```
+## Repository layout
 
-2. Download datasets and extract features
-    ```
-    python vowel_beat_detector/src/main.py \
-    -in <dataset_path> \
-    -out data/<dataset_name> \
-    -sr 16000
-    ```
-    Our experiments use the mTEDx_pt and g_neutral_speech_male datasets and automatically resample all audios to 16kHz. More detailed insctructions on how to download and process the datasets can be found in [TODO: add data processing scripts]
+```text
+config/consolidate/         Final experiment configs
+exp/consolidate/            Final test metrics, predictions, and HPO best params
+src/                        Model, dataloader, training, HPO, and inference code
+slurm/                      Slurm templates for training, HPO, evaluation, and MFA
+speech_feature_extractor/   Feature extraction submodule
+utils/                      Speechocean metadata and VC-feature preparation tools
+test/                       Dataloader smoke tests
+environment.yml             Python environment
+```
 
-    The features will be extracted into a ``.lmdb`` file. Each entry in the file can be read similarly to a python dictionary where item corresponds to a type of feature. 
+## 1. Environment
 
-3. Set up the dataloader
+Initialize the feature-extractor submodule:
 
-    If you're implementing your own dataset, you will need to build a pytorch-style dataloader for it then add the dataset name in the training script.
+```bash
+git submodule update --init --recursive
+```
 
-    If you're using the already implemented datasets, simply use the dataset name in the training config file.
+Create and activate the main environment:
 
-    The adopted approach is to specify samples IDs with data_sources.py then feed them to the DatasetLMDB class and create a dataloader from it.
+```bash
+conda env create -f environment.yml
+conda activate rtm
+```
 
-    data_sources looks at the CSV file created with create_arctic_data.py
+The consolidated code requires Python 3.10, PyTorch, NumPy, Pandas, SciPy,
+scikit-learn, Matplotlib, lmdb, Optuna, and wandb. Forced alignment for
+`dur`/`durZ` preparation requires `montreal-forced-aligner`.
 
-4. Config file
-    Specify all desired training and model parameters in a ``.json`` file inside ``/config``
+## 2. Required data
 
-5. Run training script
-    ```
-    python -m src.train --config <config_path>
-    ```
+The training and evaluation code expects:
 
-6. Follow experiment
-    Training and evaluation metrics, as well as checkpoints, will be saved under ``/exp`` with the ``exp_name`` as defined in the used config file.
+| Path | Description |
+|---|---|
+| `data/speechocean/rtm_feats.lmdb` | LMDB with envelope and envelope-derivative sequences |
+| `data/speechocean/speechocean_metadata.csv` | Identifier -> fluency/prosodic score |
+| `data/speechocean/vc_features.json` | Tokenized V/C intervals and phone durations for `dur`/`durZ` |
+
+The first two files can be created from Speechocean WAVs, score files, and
+Kaldi-style `utt2spk` files as described below.
+
+## 3. Build Speechocean metadata
+
+Extract the envelope/envelope-derivative LMDB used by the consolidated models:
+
+```bash
+bash utils/extract_features.sh /path/to/speechocean/wavs data/speechocean bark
+```
+
+Then create the metadata CSV:
+
+```bash
+python utils/create_speechocean_table.py \
+    --lmdb data/speechocean/rtm_feats.lmdb \
+    --scores /path/to/scores.json \
+    --train_utt2spk /path/to/train_utt2spk \
+    --test_utt2spk /path/to/test_utt2spk \
+    --output data/speechocean/speechocean_metadata.csv
+```
+
+## 4. Build duration features
+
+Only required for `dur` and `durZ` experiments.
+
+1. Prepare MFA input and run forced alignment:
+
+```bash
+sbatch slurm/mfa_align.sh
+```
+
+2. Build V/C alignments, z-scored phone durations, and tokenized VC features:
+
+```bash
+bash utils/build_vc_pipeline.sh data/speechocean
+```
+
+This creates `vc_alignments.json`, `phone_duration_stats.json`, and
+`vc_features.json`.
+
+## 5. Verify dataloaders
+
+```bash
+python -m test.test_dataloader
+python -m test.test_duration_dataloader
+```
+
+## 6. Train a single experiment
+
+```bash
+python -m src.train --config config/consolidate/<config>.json
+```
+
+On Slurm:
+
+```bash
+sbatch slurm/train.sh config/consolidate/<config>.json
+```
+
+Training uses MSE, gradient clipping at 5.0, and early stopping on validation
+Spearman r. Outputs are written under `exp/<exp_name>/`.
+
+## 7. Run hyperparameter search
+
+```bash
+python -m src.hpo \
+    --config config/consolidate/<config>.json \
+    --n_trials 80
+```
+
+On Slurm:
+
+```bash
+sbatch slurm/hpo.sh config/consolidate/<config>.json 80
+```
+
+HPO selects the best trial on validation Spearman r and automatically runs
+test-set inference with the best checkpoint.
+
+## 8. Evaluate a trained checkpoint
+
+```bash
+python -m src.eval_regression \
+    --config config/consolidate/<config>.json \
+    --checkpoint /path/to/best_model_epochN.pth \
+    --split Test
+```
+
+On Slurm:
+
+```bash
+sbatch slurm/eval.sh \
+    config/consolidate/<config>.json \
+    /path/to/best_model_epochN.pth \
+    Test
+```
+
+## 9. Consolidated results
+
+The final configurations and their result directories are:
+
+| Input | Fluency | Prosodic |
+|---|---|---|
+| Envelope | `env_fluency_lstm_bi` | `env_prosody_lstm_bi` |
+| Envelope derivative | `envRate_fluency_lstm_bi` | `envRate_prosody_lstm_bi` |
+| Phone durations | `dur_fluency_lstm_bi` | `dur_prosody_lstm_bi` |
+| Z-scored phone durations | `durZ_fluency_lstm_bi` | `durZ_prosody_lstm_bi` |
+
+For each experiment, the final metrics are in:
+
+```text
+exp/consolidate/<experiment>/eval/summary_Test_*.json
+exp/consolidate/<experiment>/eval/predictions_Test_*.csv
+```
+
+Fluency experiments also include `hpo_best.json` with the selected
+hyperparameters. Prosody experiments reuse the corresponding fluency
+hyperparameters.

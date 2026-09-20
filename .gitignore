@@ -207,8 +207,15 @@ marimo/_lsp/
 __marimo__/
 
 data
-slurm
-exp
-inference
-stats
-config
+slurm/out
+analysis/rhythm_encoder
+AGENTS.md
+config/dump
+exp/*
+!exp/consolidate/
+exp/consolidate/*
+!exp/consolidate/*/eval/
+!exp/consolidate/*/eval/summary_Test_*.json
+!exp/consolidate/*/eval/predictions_Test_*.csv
+!exp/consolidate/*/hpo_best.json
+.claude

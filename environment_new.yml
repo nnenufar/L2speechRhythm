@@ -1,0 +1,25 @@
+name: rtm
+channels:
+  - https://software.repos.intel.com/python/conda/
+  - https://repo.anaconda.com/pkgs/main
+  - https://repo.anaconda.com/pkgs/r
+dependencies:
+  - praatio
+  - librosa
+  - scikit-learn
+  - pandas
+  - python=3.10
+  - numpy
+  - pip
+  - scipy
+  - matplotlib
+  - tqdm
+  - pyarrow
+  - pywavelets
+  - conda-forge::transformers
+  - conda-forge::wandb
+  - conda-forge::umap-learn
+  - conda-forge::g2p-en
+  - montreal-forced-aligner
+  
+prefix: /home/joao.lima/miniconda3/envs/rtm

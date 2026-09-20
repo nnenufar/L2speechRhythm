@@ -1,0 +1,3 @@
+[submodule "speech_feature_extractor"]
+	path = speech_feature_extractor
+	url = https://github.com/AI-Unicamp/Speech-Feature-Extractor

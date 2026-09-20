@@ -1,0 +1,58 @@
+{
+  "exp_name": "env_prosody_lstm_bi",
+  "model_type": "rhythm_regressor",
+  "batch_size": 64,
+  "collate_fn": "pad",
+  "model_params": {
+    "freeze_encoder": false,
+    "hidden_size": 128,
+    "dropout": 0.2,
+    "feat_dim": 1,
+    "kernel_size": 7,
+    "cnn_out_channels": 128,
+    "num_cnn_layers": 3,
+    "cnn_stride": [3,4,5],
+    "task": "regression",
+    "main_item": "envelope",
+    "use_transformer": false,
+    "lstm_bidirectional": true,
+    "lstm_hidden_size": 32,
+    "lstm_num_layers": 2,
+    "d_model": 32,
+    "num_heads": 2,
+    "num_layers": 2,
+    "max_len": 256
+  },
+  "dataset_params": {
+    "lmdb_path": "data/speechocean/rtm_feats.lmdb",
+    "data_source": "speechocean_custom",
+    "items": ["envelope"],
+    "test_size": 0.2,
+    "label_column": "prosodic"
+  },
+  "training_params": {
+    "learning_rate": 1e-3,
+    "num_epochs": 1000,
+    "weight_decay": 1e-5,
+    "plot_every": 10,
+    "save_every": 10,
+    "use_early_stopping": true,
+    "early_stop_patience": 50
+  },
+
+  "hpo": {
+      "n_trials": "100",
+      "direction": "maximize",
+      "pruner": "median",
+      "search_space": {
+        "training_params.learning_rate": {"type": "categorical", "choices": [1e-4, 1e-3]},
+        "training_params.weight_decay":  {"type": "categorical", "choices": [1e-5, 1e-4, 5e-4]},
+        "model_params.dropout":          {"type": "categorical", "choices": [0.1, 0.2]},
+        "model_params.cnn_out_channels": {"type": "categorical", "choices": [32, 64, 128]},
+        "model_params.kernel_size": {"type": "categorical", "choices": [3, 7]},
+        "model_params.hidden_size": {"type": "categorical", "choices": [32, 64, 128]},
+        "model_params.d_model": {"type": "categorical", "choices": [32, 64, 128]},
+        "model_params.lstm_num_layers": {"type": "categorical", "choices":[1,2]}
+   }
+  }
+}
